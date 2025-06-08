@@ -147,6 +147,7 @@ typedef enum {
   TIFFTAG_ANALOG_BALANCE = 50727,
   TIFFTAG_AS_SHOT_NEUTRAL = 50728,
   TIFFTAG_AS_SHOT_WHITE_XY = 50729,
+  TIFFTAG_BASELINE_EXPOSURE = 50730, // per file exposure compensation offset recognized by davinci resolve
   TIFFTAG_CALIBRATION_ILLUMINANT1 = 50778,
   TIFFTAG_CALIBRATION_ILLUMINANT2 = 50779,
   TIFFTAG_EXTRA_CAMERA_PROFILES = 50933,
@@ -319,6 +320,9 @@ class DNGImage {
 
   /// Specify the the selected white balance at time of capture, encoded as x-y chromaticity coordinates.
   bool SetAsShotWhiteXY(const float x, const float y);
+
+  /// Set baseline exposure value in EV units
+  bool SetBaselineExposure(float value);
 
   /// Set image data with packing (take 16-bit values and pack them to input_bpp values).
   bool SetImageDataPacked(const unsigned short *input_buffer, const int input_count, const unsigned int input_bpp, bool big_endian);
@@ -1794,6 +1798,29 @@ bool DNGImage::SetAsShotWhiteXY(const float x, const float y) {
                           TIFF_RATIONAL, uint32_t(vs.size() / 2),
                           reinterpret_cast<const unsigned char *>(vs.data()),
                           &ifd_tags_, &data_os_);
+
+  if (!ret) {
+    return false;
+  }
+
+  num_fields_++;
+  return true;
+}
+
+bool DNGImage::SetBaselineExposure(float value) {
+  float numerator, denominator;
+  if (FloatToRational(value, &numerator, &denominator) != 0) {
+    // Couldn't represent fp value as integer rational value.
+    return false;
+  }
+
+  int data[2];
+  data[0] = static_cast<int>(numerator);
+  data[1] = static_cast<int>(denominator);
+
+  bool ret = WriteTIFFTag(
+      static_cast<unsigned short>(TIFFTAG_BASELINE_EXPOSURE), TIFF_SRATIONAL, 1,
+      reinterpret_cast<const unsigned char *>(data), &ifd_tags_, &data_os_);
 
   if (!ret) {
     return false;
