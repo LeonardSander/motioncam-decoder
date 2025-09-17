@@ -109,6 +109,8 @@ typedef enum {
   TIFFTAG_COMPRESSION = 259,
   TIFFTAG_PHOTOMETRIC = 262,
   TIFFTAG_IMAGEDESCRIPTION = 270,
+  TIFFTAG_MAKE = 271,
+  TIFFTAG_CAMERA_MODEL_NAME = 272,
   TIFFTAG_STRIP_OFFSET = 273,
   TIFFTAG_SAMPLES_PER_PIXEL = 277,
   TIFFTAG_ROWS_PER_STRIP = 278,
@@ -262,6 +264,18 @@ class DNGImage {
   /// Currently we limit to 1024*1024 chars at max.
   ///
   bool SetUniqueCameraModel(const std::string &ascii);
+
+  ///
+  /// Set camera make (manufacturer) string.
+  /// Currently we limit to 1024*1024 chars at max.
+  ///
+  bool SetMake(const std::string &ascii);
+
+  ///
+  /// Set camera model name string.
+  /// Currently we limit to 1024*1024 chars at max.
+  ///
+  bool SetCameraModelName(const std::string &ascii);
 
   ///
   /// Set software description(string).
@@ -1330,6 +1344,60 @@ bool DNGImage::SetUniqueCameraModel(const std::string &ascii) {
   }
 
   bool ret = WriteTIFFTag(static_cast<unsigned short>(TIFFTAG_UNIQUE_CAMERA_MODEL),
+                          TIFF_ASCII, count,
+                          reinterpret_cast<const unsigned char *>(ascii.data()),
+                          &ifd_tags_, &data_os_);
+
+  if (!ret) {
+    return false;
+  }
+
+  num_fields_++;
+  return true;
+}
+
+bool DNGImage::SetMake(const std::string &ascii) {
+  unsigned int count =
+      static_cast<unsigned int>(ascii.length() + 1);  // +1 for '\0'
+
+  if (count < 2) {
+    // empty string
+    return false;
+  }
+
+  if (count > (1024 * 1024)) {
+    // too large
+    return false;
+  }
+
+  bool ret = WriteTIFFTag(static_cast<unsigned short>(TIFFTAG_MAKE),
+                          TIFF_ASCII, count,
+                          reinterpret_cast<const unsigned char *>(ascii.data()),
+                          &ifd_tags_, &data_os_);
+
+  if (!ret) {
+    return false;
+  }
+
+  num_fields_++;
+  return true;
+}
+
+bool DNGImage::SetCameraModelName(const std::string &ascii) {
+  unsigned int count =
+      static_cast<unsigned int>(ascii.length() + 1);  // +1 for '\0'
+
+  if (count < 2) {
+    // empty string
+    return false;
+  }
+
+  if (count > (1024 * 1024)) {
+    // too large
+    return false;
+  }
+
+  bool ret = WriteTIFFTag(static_cast<unsigned short>(TIFFTAG_CAMERA_MODEL_NAME),
                           TIFF_ASCII, count,
                           reinterpret_cast<const unsigned char *>(ascii.data()),
                           &ifd_tags_, &data_os_);
