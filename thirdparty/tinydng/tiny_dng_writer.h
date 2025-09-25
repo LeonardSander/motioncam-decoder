@@ -159,6 +159,7 @@ typedef enum {
   TIFFTAG_ACTIVE_AREA = 50829,
   TIFFTAG_FORWARD_MATRIX1 = 50964,
   TIFFTAG_FORWARD_MATRIX2 = 50965,
+  TIFFTAG_LINEARIZATION_TABLE = 50712,
 
   // CinemaDNG specific
   TIFFTAG_TIMECODE = 51043,
@@ -337,6 +338,21 @@ class DNGImage {
 
   /// Set baseline exposure value in EV units
   bool SetBaselineExposure(float value);
+
+  /// Set linearization table for converting stored values to linear values.
+  /// The table maps stored pixel values to linear values using direct mapping.
+  /// @param[in] table_size Number of entries in the linearization table (should be 2^input_bits)
+  /// @param[in] table_values Array of linear output values (TIFF_SHORT format, 0-65535)
+  bool SetLinearizationTable(const unsigned int table_size, const unsigned short *table_values);
+
+  /// Generate and set linearization table for log-to-linear conversion.
+  /// Creates a direct mapping table from log-encoded values to 16-bit linear values.
+  /// @param[in] input_bits Bit depth of input log data (e.g., 10, 12, 14)
+  /// @param[in] log_base Base of the logarithm (e.g., 2.0 for log2, 10.0 for log10)
+  /// @param[in] black_level Black level in linear space (0-65535)
+  /// @param[in] white_level White level in linear space (0-65535)
+  bool SetLogLinearizationTable(const unsigned int input_bits, const float log_base = 2.0f, 
+                               const unsigned short black_level = 0, const unsigned short white_level = 65535);
 
   /// Set image data with packing (take 16-bit values and pack them to input_bpp values).
   bool SetImageDataPacked(const unsigned short *input_buffer, const int input_count, const unsigned int input_bpp, bool big_endian);
@@ -1891,6 +1907,42 @@ bool DNGImage::SetBaselineExposure(float value) {
       reinterpret_cast<const unsigned char *>(data), &ifd_tags_, &data_os_);
 
   if (!ret) {
+    return false;
+  }
+
+  num_fields_++;
+  return true;
+}
+
+bool DNGImage::SetLinearizationTable(const unsigned int table_size, const unsigned short *table_values) {
+  if ((table_values == NULL) || (table_size < 1)) {
+    err_ += "Invalid linearization table parameters.\n";
+    return false;
+  }
+
+  // Validate table size - common sizes are 256, 1024, 4096, 16384, 65536
+  if (table_size > 65536) {
+    err_ += "Linearization table size too large (max 65536 entries).\n";
+    return false;
+  }
+
+  // Create a copy of the table values for endian swapping if needed
+  std::vector<unsigned short> vs(table_size);
+  for (size_t i = 0; i < table_size; i++) {
+    vs[i] = table_values[i];
+    
+    // Swap endian if needed
+    if (swap_endian_) {
+      swap2(&vs[i]);
+    }
+  }
+
+  bool ret = WriteTIFFTag(
+      static_cast<unsigned short>(TIFFTAG_LINEARIZATION_TABLE), TIFF_SHORT, table_size,
+      reinterpret_cast<const unsigned char *>(vs.data()), &ifd_tags_, &data_os_);
+
+  if (!ret) {
+    err_ += "Failed to write linearization table tag.\n";
     return false;
   }
 
