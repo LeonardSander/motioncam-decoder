@@ -26,7 +26,26 @@
 
 namespace motioncam {
     typedef int64_t Timestamp;
-    typedef std::pair<Timestamp, std::vector<int16_t>> AudioChunk;
+    
+    // Audio sample format enum
+    enum class AudioSampleFormat {
+        Int16,
+        Float32
+    };
+    
+    // Audio chunk with variant data for int16 or float32 samples
+    struct AudioChunk {
+        Timestamp timestamp;
+        AudioSampleFormat format;
+        std::vector<int16_t> int16Data;
+        std::vector<float> float32Data;
+        
+        AudioChunk() : timestamp(-1), format(AudioSampleFormat::Int16) {}
+        
+        size_t sampleCount() const {
+            return format == AudioSampleFormat::Float32 ? float32Data.size() : int16Data.size();
+        }
+    };
 
     class MotionCamException : public std::runtime_error {
     public:

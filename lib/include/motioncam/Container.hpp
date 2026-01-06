@@ -42,7 +42,8 @@ namespace motioncam {
         METADATA,
         AUDIO_INDEX,
         AUDIO_DATA,
-        AUDIO_DATA_METADATA
+        AUDIO_DATA_METADATA,
+        AUDIO_DATA_F32
     };
 
     struct Item {
