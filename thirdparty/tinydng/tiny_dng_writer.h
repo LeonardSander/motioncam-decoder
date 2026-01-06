@@ -2541,33 +2541,46 @@ void OpcodeList::AddFixBadPixelsList(const FixBadPixelsParams& params) {
 void OpcodeList::AddGainMap(const GainMapParams& params) {
   Opcode opcode;
   opcode.id = OPCODE_GAIN_MAP;
+  // DNG version 1.3.0.0
   opcode.version[0] = 1; opcode.version[1] = 3; opcode.version[2] = 0; opcode.version[3] = 0;
   opcode.flags = 0;
   
   std::ostringstream data_stream;
   
-  // Write parameters (big-endian)
+  // Write area of interest (LONG: top, left, bottom, right)
   Write4(params.top, &data_stream, true);
   Write4(params.left, &data_stream, true);
   Write4(params.bottom, &data_stream, true);
   Write4(params.right, &data_stream, true);
+  
+  // Write plane info (LONG: plane, planes)
   Write4(params.plane, &data_stream, true);
   Write4(params.planes, &data_stream, true);
+  
+  // Write pitch (LONG: row_pitch, col_pitch)
   Write4(params.row_pitch, &data_stream, true);
   Write4(params.col_pitch, &data_stream, true);
+  
+  // Write map dimensions (LONG: map_points_v, map_points_h)
   Write4(params.map_points_v, &data_stream, true);
   Write4(params.map_points_h, &data_stream, true);
   
+  // Write spacing (DOUBLE: map_spacing_v, map_spacing_h)
   WriteDouble(params.map_spacing_v, &data_stream, true);
   WriteDouble(params.map_spacing_h, &data_stream, true);
+  
+  // Write origin (DOUBLE: map_origin_v, map_origin_h)
   WriteDouble(params.map_origin_v, &data_stream, true);
   WriteDouble(params.map_origin_h, &data_stream, true);
   
+  // Write map planes (LONG: map_planes)
   Write4(params.map_planes, &data_stream, true);
   
-  // Write gain map data
-  for (float gain : params.gain_data) {
-    WriteFloat(gain, &data_stream, true);
+  // Write gain map data (FLOAT array)
+  // For each MapPointsV, for each MapPointsH, for each MapPlanes: MapGain (FLOAT)
+  size_t expected_size = params.map_points_v * params.map_points_h * params.map_planes;
+  for (size_t i = 0; i < params.gain_data.size() && i < expected_size; i++) {
+    WriteFloat(params.gain_data[i], &data_stream, true);
   }
   
   std::string data_str = data_stream.str();
@@ -2583,17 +2596,22 @@ std::vector<unsigned char> OpcodeList::Serialize() const {
   
   std::ostringstream stream;
   
-  // Write opcode count (big-endian)
+  // Write opcode count (big-endian, 32-bit uint)
   Write4(static_cast<unsigned int>(opcodes_.size()), &stream, true);
   
   for (const auto& opcode : opcodes_) {
-    // Write opcode header
+    // Write opcode ID (32-bit uint)
     Write4(opcode.id, &stream, true);
-    Write4(opcode.version[0], &stream, true);
-    Write4(opcode.version[1], &stream, true);
-    Write4(opcode.version[2], &stream, true);
-    Write4(opcode.version[3], &stream, true);
+    
+    // Write DNG version as single 32-bit value (e.g., 0x01030000 for version 1.3.0.0)
+    unsigned int dng_version = (opcode.version[0] << 24) | (opcode.version[1] << 16) | 
+                               (opcode.version[2] << 8) | opcode.version[3];
+    Write4(dng_version, &stream, true);
+    
+    // Write flags (32-bit uint)
     Write4(opcode.flags, &stream, true);
+    
+    // Write data size (32-bit uint)
     Write4(static_cast<unsigned int>(opcode.data.size()), &stream, true);
     
     // Write opcode data
