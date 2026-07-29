@@ -32,6 +32,21 @@ THE SOFTWARE.
 #include <sstream>
 #include <vector>
 
+// Enable JPEG compression by default (using lj92 for true lossless)
+#ifndef TINY_DNG_ENABLE_JPEG
+#define TINY_DNG_ENABLE_JPEG
+#endif
+
+// For deflate compression support
+#ifdef TINY_DNG_ENABLE_DEFLATE
+#include <zlib.h>
+#endif
+
+// For JPEG compression support (using lj92 for true lossless)
+#ifdef TINY_DNG_ENABLE_JPEG
+#include "../liblj92/lj92.h"
+#endif
+
 #ifndef ROL32
 #define ROL32(v,a) ((v) << (a) | (v) >> (32-(a)))
 #endif
@@ -108,6 +123,7 @@ typedef enum {
   TIFFTAG_BITS_PER_SAMPLE = 258,
   TIFFTAG_COMPRESSION = 259,
   TIFFTAG_PHOTOMETRIC = 262,
+  TIFFTAG_PREDICTOR = 317,
   TIFFTAG_IMAGEDESCRIPTION = 270,
   TIFFTAG_MAKE = 271,
   TIFFTAG_CAMERA_MODEL_NAME = 272,
@@ -185,7 +201,11 @@ static const int PLANARCONFIG_SEPARATE = 2;
 
 // COMPRESSION
 // TODO(syoyo) more compressin types.
-static const int COMPRESSION_NONE = 1;
+enum CompressionType : int {
+  COMPRESSION_NONE = 1,
+  COMPRESSION_JPEG = 7,       // JPEG compression (lossy or lossless)
+  COMPRESSION_DEFLATE = 8     // ZIP/Deflate compression
+};
 
 // ORIENTATION
 static const int ORIENTATION_TOPLEFT = 1;
@@ -315,6 +335,7 @@ class DNGImage {
   bool SetPlanarConfig(unsigned short value);
   bool SetOrientation(unsigned short value);
   bool SetCompression(unsigned short value);
+  bool SetPredictor(unsigned short value);    //untested
   bool SetSampleFormat(const unsigned int num_samples,
                        const unsigned short *values);
   bool SetXResolution(float value);
@@ -476,6 +497,11 @@ class DNGImage {
   unsigned short num_fields_;
   unsigned int samples_per_pixels_;
   std::vector<unsigned short> bits_per_samples_;
+  unsigned short compression_type_{COMPRESSION_NONE};
+  
+  // Image dimensions (needed for JPEG compression)
+  unsigned int image_width_{0};
+  unsigned int image_height_{0};
 
   // TODO(syoyo): Support multiple strips
   size_t data_strip_offset_{0};
@@ -706,6 +732,280 @@ static void swap8(uint64_t *val) {
   dst[7] = src[0];
 }
 
+// Helper function to compress data using deflate
+/*static bool CompressDeflate(const unsigned char* input, size_t input_size,
+                           std::vector<unsigned char>& output, std::string* err) {
+#ifdef TINY_DNG_ENABLE_DEFLATE
+  if (input == nullptr || input_size == 0) {
+    if (err) {
+      *err = "Invalid input to CompressDeflate";
+    }
+    return false;
+  }
+  
+  // Use raw deflate (RFC 1951) as per TIFF specification
+  z_stream stream;
+  memset(&stream, 0, sizeof(stream));
+  stream.zalloc = Z_NULL;
+  stream.zfree = Z_NULL;
+  stream.opaque = Z_NULL;
+  
+  // Negative windowBits = raw deflate (no zlib header/trailer)
+  // This is what TIFF Compression=8 expects
+  int result = deflateInit2(&stream, 
+                           Z_DEFAULT_COMPRESSION,  // compression level
+                           Z_DEFLATED,              // method
+                           -15,                     // negative = raw deflate, 15 = max window
+                           8,                       // memLevel (default)
+                           Z_DEFAULT_STRATEGY);     // strategy
+  
+  if (result != Z_OK) {
+    if (err) {
+      *err = "deflateInit2 failed: " + std::to_string(result);
+    }
+    return false;
+  }
+  
+  // Allocate output buffer
+  size_t max_output_size = deflateBound(&stream, input_size);
+  output.resize(max_output_size);
+  
+  // Set up stream
+  stream.avail_in = static_cast<uInt>(input_size);
+  stream.next_in = const_cast<Bytef*>(input);
+  stream.avail_out = static_cast<uInt>(max_output_size);
+  stream.next_out = output.data();
+  
+  // Compress in one go
+  result = deflate(&stream, Z_FINISH);
+  
+  if (result != Z_STREAM_END) {
+    deflateEnd(&stream);
+    if (err) {
+      *err = "deflate failed: " + std::to_string(result);
+    }
+    return false;
+  }
+  
+  size_t compressed_size = stream.total_out;
+  deflateEnd(&stream);
+  
+  // Resize to actual size
+  output.resize(compressed_size);
+  
+  // Verify compression worked by checking size
+  if (compressed_size == 0 || compressed_size > input_size * 2) {
+    if (err) {
+      *err = "Suspicious compressed size: " + std::to_string(compressed_size);
+    }
+    return false;
+  }
+  
+  return true;
+#else
+  if (err) {
+    *err = "Deflate compression not enabled. Define TINY_DNG_ENABLE_DEFLATE and link with zlib.";
+  }
+  return false;
+#endif
+}*/
+
+// Helper function to compress data using JPEG lossless (lj92)
+static bool CompressJPEGLossless(const unsigned char* input, size_t input_size,
+                                 int width, int height, int components, int bits_per_sample,
+                                 std::vector<unsigned char>& output, std::string* err) {
+#ifdef TINY_DNG_ENABLE_JPEG
+  if (input == nullptr || input_size == 0) {
+    if (err) {
+      *err = "Invalid input to CompressJPEGLossless";
+    }
+    return false;
+  }
+  
+  // lj92 only supports single component (grayscale) images
+  if (components != 1) {
+    if (err) {
+      *err = "lj92 only supports single component images";
+    }
+    return false;
+  }
+  
+  // Convert input to uint16_t array
+  int pixel_count = width * height;
+  uint16_t* image_data = new uint16_t[pixel_count];
+  
+  uint16_t max_value = 0;
+  uint16_t min_value = 65535;
+  
+  // Check if data is actually 16-bit by examining input_size
+  // For true 8-bit: input_size = pixel_count
+  // For 16-bit: input_size = pixel_count * 2
+  //bool is_16bit_storage = (input_size >= pixel_count * 2);
+  
+  //if (bits_per_sample <= 8 && !is_16bit_storage) {
+    // True 8-bit packed data (1 byte per pixel)
+  //  for (int i = 0; i < pixel_count; i++) {
+  //    image_data[i] = input[i];
+  //    if (image_data[i] > max_value) max_value = image_data[i];
+  //    if (image_data[i] < min_value) min_value = image_data[i];
+  //  }
+  //} else {
+    // 16-bit unpacked data
+    const uint16_t* input16 = reinterpret_cast<const uint16_t*>(input);
+    
+    // Debug: check if endianness is correct by examining first few bytes
+    if (err && pixel_count > 0) {
+      *err += "Raw bytes: [" + std::to_string(input[0]) + " " + std::to_string(input[1]) + 
+              "] = uint16: " + std::to_string(input16[0]) + "\n";
+      *err += "Expected for little-endian: " + std::to_string(input[0] | (input[1] << 8)) + "\n";
+    }
+    
+    for (int i = 0; i < pixel_count; i++) {
+      image_data[i] = input16[i];
+      if (image_data[i] > max_value) max_value = image_data[i];
+      if (image_data[i] < min_value) min_value = image_data[i];
+    }
+  //}
+  
+  // Validate bit depth matches actual data range
+  uint16_t expected_max = (1 << bits_per_sample) - 1;
+  
+  std::string debug_msg = "JPEG input: min=" + std::to_string(min_value) + 
+                          " max=" + std::to_string(max_value) + 
+                          " bits=" + std::to_string(bits_per_sample) +
+                          " expected_max=" + std::to_string(expected_max);
+  
+  if (max_value > expected_max) {
+    if (err) {
+      *err += "WARNING: Pixel values exceed bit depth! " + debug_msg + "\n";
+    }
+    // Clamp values to valid range to prevent lj92 error
+    for (int i = 0; i < pixel_count; i++) {
+      if (image_data[i] > expected_max) {
+        image_data[i] = expected_max;
+      }
+    }
+    max_value = expected_max;
+  }
+  
+  if (err) {
+    *err += debug_msg + "\n";
+  }
+  
+  // Use specified bit depth
+  int optimal_bits = bits_per_sample;
+  
+  // Encode using lj92 with optimal parameters for maximum compression
+  uint8_t* encoded = nullptr;
+  int encoded_length = 0;
+  
+  // Sample first pixels and check Bayer pattern
+  std::string sample = "First 20 pixels: ";
+  for (int i = 0; i < std::min(20, pixel_count); i++) {
+    sample += std::to_string(image_data[i]) + " ";
+  }
+  
+  // Check if data looks like proper Bayer (should have similar values in 2x2 blocks)
+  std::string bayer_check = "\nFirst 2x2 block: [" + 
+    std::to_string(image_data[0]) + " " + std::to_string(image_data[1]) + "] [" +
+    std::to_string(image_data[width]) + " " + std::to_string(image_data[width+1]) + "]";
+  sample += bayer_check;
+  
+  // Check predictor differences
+  int total_diff = 0;
+  int max_diff = 0;
+  for (int i = 1; i < std::min(1000, pixel_count); i++) {
+    int diff = abs(static_cast<int>(image_data[i]) - static_cast<int>(image_data[i-1]));
+    total_diff += diff;
+    if (diff > max_diff) max_diff = diff;
+  }
+  int avg_diff = total_diff / std::min(999, pixel_count - 1);
+  
+  if (err) {
+    *err += sample + "\n";
+    *err += "Predictor analysis: avg_diff=" + std::to_string(avg_diff) + 
+            ", max_diff=" + std::to_string(max_diff) + "\n";
+    *err += "Calling lj92_encode: width=" + std::to_string(width) + 
+            ", height=" + std::to_string(height) + 
+            ", bits=" + std::to_string(optimal_bits) + 
+            ", pixels=" + std::to_string(pixel_count) + "\n";
+  }
+  
+  // For Bayer CFA data with 16-bit unpacked storage, reshape to width*2 x height/2 for better compression
+  // This puts same-color pixels closer together horizontally
+  // Only do this for >8 bit data (which is stored as 16-bit unpacked)
+  int encode_width = width;
+  int encode_height = height;
+  
+  
+    // Reshape for better Bayer compression
+    encode_width = width * 2;
+    encode_height = height / 2;
+    
+    if (err) {
+      *err += "Reshaping for Bayer: " + std::to_string(width) + "x" + std::to_string(height) + 
+              " -> " + std::to_string(encode_width) + "x" + std::to_string(encode_height) + "\n";
+    }
+  
+  
+  int ret = lj92_encode(
+    image_data,
+    encode_width,
+    encode_height,
+    optimal_bits,  // Use optimal bit depth for maximum compression
+    encode_width,  // readLength (full width)
+    0,             // skipLength (no skip)
+    nullptr,       // delinearize (none - handled by preprocessing)
+    0,             // delinearizeLength
+    &encoded,
+    &encoded_length
+  );
+  
+  delete[] image_data;
+  
+  if (ret != LJ92_ERROR_NONE) {
+    if (err) {
+      *err = "lj92_encode failed with error code " + std::to_string(ret);
+    }
+    return false;
+  }
+  
+  if (encoded_length == 0 || encoded == nullptr) {
+    if (err) {
+      *err = "lj92_encode returned empty data";
+    }
+    return false;
+  }
+
+  // Calculate compression ratio for debugging
+  size_t uncompressed_size = static_cast<size_t>(pixel_count) * 2; // 16-bit = 2 bytes per pixel
+  double ratio = static_cast<double>(encoded_length) / static_cast<double>(uncompressed_size);
+  
+  if (err) {
+    *err += "JPEG compression: " + std::to_string(uncompressed_size) + " bytes -> " + 
+            std::to_string(encoded_length) + " bytes (" + 
+            std::to_string(ratio * 100.0) + "% of uncompressed, " +
+            std::to_string(100.0 - ratio * 100.0) + "% reduction)\n";
+  }
+  
+  // Copy to output vector
+  output.resize(encoded_length);
+  memcpy(output.data(), encoded, encoded_length);
+  
+  // Free the encoded buffer (lj92_encode allocates it)
+  free(encoded);
+  
+  return true;
+#else
+  if (err) {
+    *err = "JPEG compression not enabled. Define TINY_DNG_ENABLE_JPEG and link with lj92.";
+  }
+  return false;
+#endif
+}
+
+// Note: CompressJPEGLossy removed - lj92 only supports lossless compression
+
 static void Write1(const unsigned char c, std::ostringstream *out) {
   unsigned char value = c;
   out->write(reinterpret_cast<const char *>(&value), 1);
@@ -876,6 +1176,7 @@ bool DNGImage::SetImageWidth(const unsigned int width) {
     return false;
   }
 
+  image_width_ = width;  // Store for JPEG compression
   num_fields_++;
   return true;
 }
@@ -892,6 +1193,7 @@ bool DNGImage::SetImageLength(const unsigned int length) {
     return false;
   }
 
+  image_height_ = length;  // Store for JPEG compression
   num_fields_++;
   return true;
 }
@@ -1058,15 +1360,36 @@ bool DNGImage::SetPlanarConfig(const unsigned short value) {
 bool DNGImage::SetCompression(const unsigned short value) {
   unsigned int count = 1;
 
-  if ((value == COMPRESSION_NONE)) {
+  if ((value == COMPRESSION_NONE) || (value == COMPRESSION_JPEG) || (value == COMPRESSION_DEFLATE)) {
     // OK
   } else {
+    err_ += "ERROR: SetCompression called with invalid value: " + std::to_string(value) + "\n";
     return false;
   }
+
+  err_ += "DEBUG: SetCompression BEFORE assignment - compression_type_=" + std::to_string(compression_type_) + ", value=" + std::to_string(value) + "\n";
+  compression_type_ = value;
+  err_ += "DEBUG: SetCompression AFTER assignment - compression_type_=" + std::to_string(compression_type_) + "\n";
 
   const unsigned short data = value;
   bool ret = WriteTIFFTag(
       static_cast<unsigned short>(TIFFTAG_COMPRESSION), TIFF_SHORT, count,
+      reinterpret_cast<const unsigned char *>(&data), &ifd_tags_, &data_os_);
+
+  if (!ret) {
+    return false;
+  }
+
+  num_fields_++;
+  return true;
+}
+
+bool DNGImage::SetPredictor(const unsigned short value) {
+  unsigned int count = 1;
+
+  const unsigned short data = value;
+  bool ret = WriteTIFFTag(
+      static_cast<unsigned short>(TIFFTAG_PREDICTOR), TIFF_SHORT, count,
       reinterpret_cast<const unsigned char *>(&data), &ifd_tags_, &data_os_);
 
   if (!ret) {
@@ -2118,16 +2441,115 @@ bool DNGImage::SetImageData(const unsigned char *data, const size_t data_len) {
   }
 
   data_strip_offset_ = size_t(data_os_.tellp());
-  data_strip_bytes_ = data_len;
+  
+  const unsigned char* write_data = data;
+  size_t write_len = data_len;
+  std::vector<unsigned char> compressed_data;
+  std::vector<unsigned char> swapped_data;
+  
+  // DEBUG: Log compression type
+  err_ += "DEBUG: compression_type_ = " + std::to_string(compression_type_) + 
+          ", COMPRESSION_JPEG = " + std::to_string(COMPRESSION_JPEG) + 
+          ", COMPRESSION_NONE = " + std::to_string(COMPRESSION_NONE) + "\n";
+  
+  // Apply compression if requested
+  // NOTE: For compressed data, we compress the raw byte stream as-is.
+  // Packed data (10-bit, 12-bit, 14-bit) is already in byte format and should not be endian-swapped.
+  // Only unpacked 16-bit, 32-bit, or 64-bit data needs endian swapping, but that's handled
+  // in WriteDataToStream for uncompressed data.
+  if (compression_type_ == COMPRESSION_JPEG) {
+    // JPEG compression (lossless)
+    if (image_width_ == 0 || image_height_ == 0) {
+      err_ += "Image dimensions not set. Call SetImageWidth/SetImageLength before SetImageData for JPEG compression.\n";
+      return false;
+    }
+    
+    if (bits_per_samples_.empty()) {
+      err_ += "BitsPerSample not set. Call SetBitsPerSample before SetImageData for JPEG compression.\n";
+      return false;
+    }
+    
+    int bits = bits_per_samples_[0];
+    int components = samples_per_pixels_;
+    
+    err_ += "SetImageData: input_size=" + std::to_string(data_len) + 
+            " bytes, dimensions=" + std::to_string(image_width_) + "x" + std::to_string(image_height_) +
+            ", bits=" + std::to_string(bits) + ", components=" + std::to_string(components) + "\n";
+    
+    // Use lossless JPEG compression
+    if (!CompressJPEGLossless(data, data_len, image_width_, image_height_, 
+                              components, bits, compressed_data, &err_)) {
+      err_ += "JPEG compression failed in SetImageData\n";
+      return false;
+    }
+    
+    write_data = compressed_data.data();
+    write_len = compressed_data.size();
+    
+    if (write_len == 0) {
+      err_ += "JPEG compressed data is empty\n";
+      return false;
+    }
+  }
+  /*else if (compression_type_ == COMPRESSION_DEFLATE) {
+    // Verify input data is not all zeros
+    bool all_zeros = true;
+    for (size_t i = 0; i < std::min(data_len, size_t(1000)); i++) {
+      if (data[i] != 0) {
+        all_zeros = false;
+        break;
+      }
+    }
+    
+    if (all_zeros) {
+      err_ += "Input data appears to be all zeros!\n";
+      return false;
+    }
+    
+    // Compress the data as-is (byte stream)
+    if (!CompressDeflate(data, data_len, compressed_data, &err_)) {
+      err_ += "Compression failed in SetImageData\n";
+      return false;
+    }
+    
+    write_data = compressed_data.data();
+    write_len = compressed_data.size();
+    
+    // Verify we got some compressed data
+    if (write_len == 0) {
+      err_ += "Compressed data is empty\n";
+      return false;
+    }
+    
+    // Verify compressed data is not all zeros
+    all_zeros = true;
+    for (size_t i = 0; i < std::min(write_len, size_t(100)); i++) {
+      if (write_data[i] != 0) {
+        all_zeros = false;
+        break;
+      }
+    }
+    
+    if (all_zeros) {
+      err_ += "Compressed data is all zeros!\n";
+      return false;
+    }
+    
+    // Log compression ratio for debugging
+    float ratio = (float)write_len / (float)data_len * 100.0f;
+    // Note: Can't use spdlog here as it's in header, but we could set a flag
+  }*/
+  
+  data_strip_bytes_ = write_len;
 
-  data_os_.write(reinterpret_cast<const char *>(data),
-                 static_cast<std::streamsize>(data_len));
+  data_os_.write(reinterpret_cast<const char *>(write_data),
+                 static_cast<std::streamsize>(write_len));
 
   // NOTE: STRIP_OFFSET tag will be written at `WriteIFDToStream()`.
 
   {
     unsigned int count = 1;
-    unsigned int bytes = static_cast<unsigned int>(data_len);
+    unsigned int bytes = static_cast<unsigned int>(write_len);
 
     bool ret = WriteTIFFTag(
         static_cast<unsigned short>(TIFFTAG_STRIP_BYTE_COUNTS), TIFF_LONG,
@@ -2218,7 +2640,8 @@ bool DNGImage::WriteDataToStream(std::ostream *ofs) const {
     uint32_t bps = bits_per_samples_[0];
 
     // We may need to swap endian for pixel data.
-    if (swap_endian_) {
+    // IMPORTANT: Skip endian swapping for compressed data!
+    if (swap_endian_ && compression_type_ == COMPRESSION_NONE) {
       if (bps == 16) {
         size_t n = data_strip_bytes_ / sizeof(uint16_t);
         uint16_t *ptr =
