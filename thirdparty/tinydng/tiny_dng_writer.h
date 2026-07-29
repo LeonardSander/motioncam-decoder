@@ -288,11 +288,11 @@ struct GainMapParams {
 class OpcodeList {
 public:
   OpcodeList() = default;
-  
+
   void AddWarpRectilinear(const WarpRectilinearParams& params);
   void AddFixBadPixelsList(const FixBadPixelsParams& params);
   void AddGainMap(const GainMapParams& params);
-  
+
   std::vector<unsigned char> Serialize() const;
   bool IsEmpty() const { return opcodes_.empty(); }
 
@@ -303,7 +303,7 @@ private:
     unsigned int flags;
     std::vector<unsigned char> data;
   };
-  
+
   std::vector<Opcode> opcodes_;
 };
 
@@ -388,7 +388,7 @@ class DNGImage {
   bool SetBlackLevelRational(unsigned int num_samples, const float *values);
 
   /// Specify white level per sample.
-  bool SetWhiteLevel(const short value);
+  bool SetWhiteLevel(const unsigned short value);
   bool SetWhiteLevelRational(unsigned int num_samples, const float *values);
 
   /// Specify analog white balance from camera for raw values.
@@ -422,7 +422,7 @@ class DNGImage {
   /// Specify CFA geometric pattern (left-to-right, top-to-bottom).
   bool SetCFAPattern(const unsigned int num_components, const unsigned char *values);
   bool SetCFALayout(const unsigned short value);
-  
+
   /// Specify the selected white balance at time of capture, encoded as the coordinates of a perfectly neutral color in linear reference space values.
   bool SetAsShotNeutral(const unsigned int plane_count, const float *matrix_values);
 
@@ -447,15 +447,15 @@ class DNGImage {
   /// @param[in] log_base Base of the logarithm (e.g., 2.0 for log2, 10.0 for log10)
   /// @param[in] black_level Black level in linear space (0-65535)
   /// @param[in] white_level White level in linear space (0-65535)
-  bool SetLogLinearizationTable(const unsigned int input_bits, const float log_base = 2.0f, 
+  bool SetLogLinearizationTable(const unsigned int input_bits, const float log_base = 2.0f,
                                const unsigned short black_level = 0, const unsigned short white_level = 65535);
 
   /// Set opcode list 1 (applied to raw image as read from file)
   bool SetOpcodeList1(const OpcodeList& opcode_list);
-  
+
   /// Set opcode list 2 (applied after mapping to linear reference values)
   bool SetOpcodeList2(const OpcodeList& opcode_list);
-  
+
   /// Set opcode list 3 (applied after demosaicing)
   bool SetOpcodeList3(const OpcodeList& opcode_list);
 
@@ -498,7 +498,7 @@ class DNGImage {
   unsigned int samples_per_pixels_;
   std::vector<unsigned short> bits_per_samples_;
   unsigned short compression_type_{COMPRESSION_NONE};
-  
+
   // Image dimensions (needed for JPEG compression)
   unsigned int image_width_{0};
   unsigned int image_height_{0};
@@ -535,7 +535,7 @@ class DNGWriter {
   bool WriteToFile(const char *filename, std::string *err) const;
   bool WriteToFile(int fd, std::string *err) const;
   bool WriteToFile(std::ostream& stream, std::string *err) const;
-  
+
  private:
   bool swap_endian_;
   bool dng_big_endian_;  // Endianness of DNG file.
@@ -566,6 +566,7 @@ class DNGWriter {
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <sstream>
 
 namespace tinydngwriter {
@@ -736,49 +737,49 @@ static void swap8(uint64_t *val) {
 /*static bool CompressDeflate(const unsigned char* input, size_t input_size,
                            std::vector<unsigned char>& output, std::string* err) {
 #ifdef TINY_DNG_ENABLE_DEFLATE
-  if (input == nullptr || input_size == 0) {
+  if (input == nullptr || input_size == 0 || width <= 0 || height <= 0) {
     if (err) {
       *err = "Invalid input to CompressDeflate";
     }
     return false;
   }
-  
+
   // Use raw deflate (RFC 1951) as per TIFF specification
   z_stream stream;
   memset(&stream, 0, sizeof(stream));
   stream.zalloc = Z_NULL;
   stream.zfree = Z_NULL;
   stream.opaque = Z_NULL;
-  
+
   // Negative windowBits = raw deflate (no zlib header/trailer)
   // This is what TIFF Compression=8 expects
-  int result = deflateInit2(&stream, 
+  int result = deflateInit2(&stream,
                            Z_DEFAULT_COMPRESSION,  // compression level
                            Z_DEFLATED,              // method
                            -15,                     // negative = raw deflate, 15 = max window
                            8,                       // memLevel (default)
                            Z_DEFAULT_STRATEGY);     // strategy
-  
+
   if (result != Z_OK) {
     if (err) {
       *err = "deflateInit2 failed: " + std::to_string(result);
     }
     return false;
   }
-  
+
   // Allocate output buffer
   size_t max_output_size = deflateBound(&stream, input_size);
   output.resize(max_output_size);
-  
+
   // Set up stream
   stream.avail_in = static_cast<uInt>(input_size);
   stream.next_in = const_cast<Bytef*>(input);
   stream.avail_out = static_cast<uInt>(max_output_size);
   stream.next_out = output.data();
-  
+
   // Compress in one go
   result = deflate(&stream, Z_FINISH);
-  
+
   if (result != Z_STREAM_END) {
     deflateEnd(&stream);
     if (err) {
@@ -786,13 +787,13 @@ static void swap8(uint64_t *val) {
     }
     return false;
   }
-  
+
   size_t compressed_size = stream.total_out;
   deflateEnd(&stream);
-  
+
   // Resize to actual size
   output.resize(compressed_size);
-  
+
   // Verify compression worked by checking size
   if (compressed_size == 0 || compressed_size > input_size * 2) {
     if (err) {
@@ -800,7 +801,7 @@ static void swap8(uint64_t *val) {
     }
     return false;
   }
-  
+
   return true;
 #else
   if (err) {
@@ -821,7 +822,7 @@ static bool CompressJPEGLossless(const unsigned char* input, size_t input_size,
     }
     return false;
   }
-  
+
   // lj92 only supports single component (grayscale) images
   if (components != 1) {
     if (err) {
@@ -829,19 +830,33 @@ static bool CompressJPEGLossless(const unsigned char* input, size_t input_size,
     }
     return false;
   }
-  
+
+  if (bits_per_sample < 2 || bits_per_sample > 16) {
+    if (err) {
+      *err = "Lossless JPEG bit depth must be between 2 and 16";
+    }
+    return false;
+  }
+
   // Convert input to uint16_t array
   int pixel_count = width * height;
+  if (pixel_count <= 0 ||
+      input_size != static_cast<size_t>(pixel_count) * sizeof(uint16_t)) {
+    if (err) {
+      *err = "Lossless JPEG expects one unpacked 16-bit sample per pixel";
+    }
+    return false;
+  }
   uint16_t* image_data = new uint16_t[pixel_count];
-  
+
   uint16_t max_value = 0;
   uint16_t min_value = 65535;
-  
+
   // Check if data is actually 16-bit by examining input_size
   // For true 8-bit: input_size = pixel_count
   // For 16-bit: input_size = pixel_count * 2
   //bool is_16bit_storage = (input_size >= pixel_count * 2);
-  
+
   //if (bits_per_sample <= 8 && !is_16bit_storage) {
     // True 8-bit packed data (1 byte per pixel)
   //  for (int i = 0; i < pixel_count; i++) {
@@ -852,124 +867,56 @@ static bool CompressJPEGLossless(const unsigned char* input, size_t input_size,
   //} else {
     // 16-bit unpacked data
     const uint16_t* input16 = reinterpret_cast<const uint16_t*>(input);
-    
-    // Debug: check if endianness is correct by examining first few bytes
-    if (err && pixel_count > 0) {
-      *err += "Raw bytes: [" + std::to_string(input[0]) + " " + std::to_string(input[1]) + 
-              "] = uint16: " + std::to_string(input16[0]) + "\n";
-      *err += "Expected for little-endian: " + std::to_string(input[0] | (input[1] << 8)) + "\n";
-    }
-    
+
     for (int i = 0; i < pixel_count; i++) {
       image_data[i] = input16[i];
       if (image_data[i] > max_value) max_value = image_data[i];
       if (image_data[i] < min_value) min_value = image_data[i];
     }
   //}
-  
+
   // Validate bit depth matches actual data range
-  uint16_t expected_max = (1 << bits_per_sample) - 1;
-  
-  std::string debug_msg = "JPEG input: min=" + std::to_string(min_value) + 
-                          " max=" + std::to_string(max_value) + 
-                          " bits=" + std::to_string(bits_per_sample) +
-                          " expected_max=" + std::to_string(expected_max);
-  
+  uint16_t expected_max = bits_per_sample == 16
+      ? std::numeric_limits<uint16_t>::max()
+      : static_cast<uint16_t>((1u << bits_per_sample) - 1u);
+
   if (max_value > expected_max) {
     if (err) {
-      *err += "WARNING: Pixel values exceed bit depth! " + debug_msg + "\n";
+      *err = "Pixel values exceed the declared lossless JPEG bit depth";
     }
-    // Clamp values to valid range to prevent lj92 error
-    for (int i = 0; i < pixel_count; i++) {
-      if (image_data[i] > expected_max) {
-        image_data[i] = expected_max;
-      }
-    }
-    max_value = expected_max;
+    delete[] image_data;
+    return false;
   }
-  
-  if (err) {
-    *err += debug_msg + "\n";
-  }
-  
+
   // Use specified bit depth
   int optimal_bits = bits_per_sample;
-  
+
   // Encode using lj92 with optimal parameters for maximum compression
   uint8_t* encoded = nullptr;
   int encoded_length = 0;
-  
-  // Sample first pixels and check Bayer pattern
-  std::string sample = "First 20 pixels: ";
-  for (int i = 0; i < std::min(20, pixel_count); i++) {
-    sample += std::to_string(image_data[i]) + " ";
-  }
-  
-  // Check if data looks like proper Bayer (should have similar values in 2x2 blocks)
-  std::string bayer_check = "\nFirst 2x2 block: [" + 
-    std::to_string(image_data[0]) + " " + std::to_string(image_data[1]) + "] [" +
-    std::to_string(image_data[width]) + " " + std::to_string(image_data[width+1]) + "]";
-  sample += bayer_check;
-  
-  // Check predictor differences
-  int total_diff = 0;
-  int max_diff = 0;
-  for (int i = 1; i < std::min(1000, pixel_count); i++) {
-    int diff = abs(static_cast<int>(image_data[i]) - static_cast<int>(image_data[i-1]));
-    total_diff += diff;
-    if (diff > max_diff) max_diff = diff;
-  }
-  int avg_diff = total_diff / std::min(999, pixel_count - 1);
-  
-  if (err) {
-    *err += sample + "\n";
-    *err += "Predictor analysis: avg_diff=" + std::to_string(avg_diff) + 
-            ", max_diff=" + std::to_string(max_diff) + "\n";
-    *err += "Calling lj92_encode: width=" + std::to_string(width) + 
-            ", height=" + std::to_string(height) + 
-            ", bits=" + std::to_string(optimal_bits) + 
-            ", pixels=" + std::to_string(pixel_count) + "\n";
-  }
-  
-  // For Bayer CFA data with 16-bit unpacked storage, reshape to width*2 x height/2 for better compression
-  // This puts same-color pixels closer together horizontally
-  // Only do this for >8 bit data (which is stored as 16-bit unpacked)
-  int encode_width = width;
-  int encode_height = height;
-  
-  
-    // Reshape for better Bayer compression
-    encode_width = width * 2;
-    encode_height = height / 2;
-    
-    if (err) {
-      *err += "Reshaping for Bayer: " + std::to_string(width) + "x" + std::to_string(height) + 
-              " -> " + std::to_string(encode_width) + "x" + std::to_string(encode_height) + "\n";
-    }
-  
-  
+
   int ret = lj92_encode(
     image_data,
-    encode_width,
-    encode_height,
+    width,
+    height,
     optimal_bits,  // Use optimal bit depth for maximum compression
-    encode_width,  // readLength (full width)
+    width,         // readLength (full width)
     0,             // skipLength (no skip)
     nullptr,       // delinearize (none - handled by preprocessing)
     0,             // delinearizeLength
     &encoded,
     &encoded_length
   );
-  
+
   delete[] image_data;
-  
+
   if (ret != LJ92_ERROR_NONE) {
     if (err) {
       *err = "lj92_encode failed with error code " + std::to_string(ret);
     }
     return false;
   }
-  
+
   if (encoded_length == 0 || encoded == nullptr) {
     if (err) {
       *err = "lj92_encode returned empty data";
@@ -977,24 +924,13 @@ static bool CompressJPEGLossless(const unsigned char* input, size_t input_size,
     return false;
   }
 
-  // Calculate compression ratio for debugging
-  size_t uncompressed_size = static_cast<size_t>(pixel_count) * 2; // 16-bit = 2 bytes per pixel
-  double ratio = static_cast<double>(encoded_length) / static_cast<double>(uncompressed_size);
-  
-  if (err) {
-    *err += "JPEG compression: " + std::to_string(uncompressed_size) + " bytes -> " + 
-            std::to_string(encoded_length) + " bytes (" + 
-            std::to_string(ratio * 100.0) + "% of uncompressed, " +
-            std::to_string(100.0 - ratio * 100.0) + "% reduction)\n";
-  }
-  
   // Copy to output vector
   output.resize(encoded_length);
   memcpy(output.data(), encoded, encoded_length);
-  
+
   // Free the encoded buffer (lj92_encode allocates it)
   free(encoded);
-  
+
   return true;
 #else
   if (err) {
@@ -1367,9 +1303,7 @@ bool DNGImage::SetCompression(const unsigned short value) {
     return false;
   }
 
-  err_ += "DEBUG: SetCompression BEFORE assignment - compression_type_=" + std::to_string(compression_type_) + ", value=" + std::to_string(value) + "\n";
   compression_type_ = value;
-  err_ += "DEBUG: SetCompression AFTER assignment - compression_type_=" + std::to_string(compression_type_) + "\n";
 
   const unsigned short data = value;
   bool ret = WriteTIFFTag(
@@ -1533,7 +1467,7 @@ bool DNGImage::SetBlackLevelRational(unsigned int num_samples,
   return true;
 }
 
-bool DNGImage::SetWhiteLevel(const short value) {
+bool DNGImage::SetWhiteLevel(const unsigned short value) {
   bool ret = WriteTIFFTag(
       static_cast<unsigned short>(TIFFTAG_WHITE_LEVEL), TIFF_SHORT, 1,
       reinterpret_cast<const unsigned char *>(&value),
@@ -2379,7 +2313,7 @@ bool DNGImage::SetLinearizationTable(const unsigned int table_size, const unsign
   std::vector<unsigned short> vs(table_size);
   for (size_t i = 0; i < table_size; i++) {
     vs[i] = table_values[i];
-    
+
     // Swap endian if needed
     if (swap_endian_) {
       swap2(&vs[i]);
@@ -2407,7 +2341,7 @@ bool DNGImage::SetImageDataPacked(const unsigned short *input_buffer, const int 
 
   if (input_bpp > 16)
     return false;
-  
+
   unsigned int bits_free = 16 - input_bpp;
   const unsigned short *unpacked_bits = input_buffer;
 
@@ -2419,7 +2353,7 @@ bool DNGImage::SetImageDataPacked(const unsigned short *input_buffer, const int 
   {
     unsigned int bits_offset = (pixel_index * bits_free) % 16;
     unsigned int bits_to_rol = bits_free + bits_offset + (bits_offset > 0) * 16;
-    
+
     unsigned int data = ROL32(static_cast<unsigned int>(unpacked_bits[pixel_index]), bits_to_rol);
     *(reinterpret_cast<unsigned int *>(packed_bits)) = (*(reinterpret_cast<unsigned int *>(packed_bits)) & 0x0000FFFF) | data;
 
@@ -2441,17 +2375,12 @@ bool DNGImage::SetImageData(const unsigned char *data, const size_t data_len) {
   }
 
   data_strip_offset_ = size_t(data_os_.tellp());
-  
+
   const unsigned char* write_data = data;
   size_t write_len = data_len;
   std::vector<unsigned char> compressed_data;
   std::vector<unsigned char> swapped_data;
-  
-  // DEBUG: Log compression type
-  err_ += "DEBUG: compression_type_ = " + std::to_string(compression_type_) + 
-          ", COMPRESSION_JPEG = " + std::to_string(COMPRESSION_JPEG) + 
-          ", COMPRESSION_NONE = " + std::to_string(COMPRESSION_NONE) + "\n";
-  
+
   // Apply compression if requested
   // NOTE: For compressed data, we compress the raw byte stream as-is.
   // Packed data (10-bit, 12-bit, 14-bit) is already in byte format and should not be endian-swapped.
@@ -2463,29 +2392,29 @@ bool DNGImage::SetImageData(const unsigned char *data, const size_t data_len) {
       err_ += "Image dimensions not set. Call SetImageWidth/SetImageLength before SetImageData for JPEG compression.\n";
       return false;
     }
-    
+
     if (bits_per_samples_.empty()) {
       err_ += "BitsPerSample not set. Call SetBitsPerSample before SetImageData for JPEG compression.\n";
       return false;
     }
-    
+
     int bits = bits_per_samples_[0];
     int components = samples_per_pixels_;
-    
-    err_ += "SetImageData: input_size=" + std::to_string(data_len) + 
+
+    err_ += "SetImageData: input_size=" + std::to_string(data_len) +
             " bytes, dimensions=" + std::to_string(image_width_) + "x" + std::to_string(image_height_) +
             ", bits=" + std::to_string(bits) + ", components=" + std::to_string(components) + "\n";
-    
+
     // Use lossless JPEG compression
-    if (!CompressJPEGLossless(data, data_len, image_width_, image_height_, 
+    if (!CompressJPEGLossless(data, data_len, image_width_, image_height_,
                               components, bits, compressed_data, &err_)) {
       err_ += "JPEG compression failed in SetImageData\n";
       return false;
     }
-    
+
     write_data = compressed_data.data();
     write_len = compressed_data.size();
-    
+
     if (write_len == 0) {
       err_ += "JPEG compressed data is empty\n";
       return false;
@@ -2500,27 +2429,27 @@ bool DNGImage::SetImageData(const unsigned char *data, const size_t data_len) {
         break;
       }
     }
-    
+
     if (all_zeros) {
       err_ += "Input data appears to be all zeros!\n";
       return false;
     }
-    
+
     // Compress the data as-is (byte stream)
     if (!CompressDeflate(data, data_len, compressed_data, &err_)) {
       err_ += "Compression failed in SetImageData\n";
       return false;
     }
-    
+
     write_data = compressed_data.data();
     write_len = compressed_data.size();
-    
+
     // Verify we got some compressed data
     if (write_len == 0) {
       err_ += "Compressed data is empty\n";
       return false;
     }
-    
+
     // Verify compressed data is not all zeros
     all_zeros = true;
     for (size_t i = 0; i < std::min(write_len, size_t(100)); i++) {
@@ -2529,17 +2458,17 @@ bool DNGImage::SetImageData(const unsigned char *data, const size_t data_len) {
         break;
       }
     }
-    
+
     if (all_zeros) {
       err_ += "Compressed data is all zeros!\n";
       return false;
     }
-    
+
     // Log compression ratio for debugging
     float ratio = (float)write_len / (float)data_len * 100.0f;
     // Note: Can't use spdlog here as it's in header, but we could set a flag
   }*/
-  
+
   data_strip_bytes_ = write_len;
 
   data_os_.write(reinterpret_cast<const char *>(write_data),
@@ -2774,7 +2703,7 @@ bool DNGWriter::WriteToFile(const char *filename, std::string *err) const {
 
     return false;
   }
-  
+
   return WriteToFile(ofs, err);
 }
 
@@ -2788,7 +2717,7 @@ bool DNGWriter::WriteToFile(int fd, std::string *err) const {
 
     return false;
   }
-  
+
   return WriteToFile(ofs, err);
 }
 
@@ -2891,40 +2820,40 @@ void OpcodeList::AddWarpRectilinear(const WarpRectilinearParams& params) {
   opcode.id = OPCODE_WARP_RECTILINEAR;
   opcode.version[0] = 1; opcode.version[1] = 3; opcode.version[2] = 0; opcode.version[3] = 0;
   opcode.flags = 0;
-  
+
   std::ostringstream data_stream;
-  
+
   // Write parameters (big-endian as per DNG spec for opcode blocks)
   Write4(params.num_coeff_sets, &data_stream, true);
-  
+
   for (size_t i = 0; i < params.num_coeff_sets; i++) {
     // Write radial coefficients (kr0, kr1, kr2, kr3)
     double kr0 = i < params.kr0.size() ? params.kr0[i] : 1.0;
     double kr1 = i < params.kr1.size() ? params.kr1[i] : 0.0;
     double kr2 = i < params.kr2.size() ? params.kr2[i] : 0.0;
     double kr3 = i < params.kr3.size() ? params.kr3[i] : 0.0;
-    
+
     // Write doubles in big-endian
     WriteDouble(kr0, &data_stream, true);
     WriteDouble(kr1, &data_stream, true);
     WriteDouble(kr2, &data_stream, true);
     WriteDouble(kr3, &data_stream, true);
-    
+
     // Write tangential coefficients (kt0, kt1)
     double kt0 = i < params.kt0.size() ? params.kt0[i] : 0.0;
     double kt1 = i < params.kt1.size() ? params.kt1[i] : 0.0;
-    
+
     WriteDouble(kt0, &data_stream, true);
     WriteDouble(kt1, &data_stream, true);
   }
-  
+
   // Write optical center
   WriteDouble(params.cx_hat, &data_stream, true);
   WriteDouble(params.cy_hat, &data_stream, true);
-  
+
   std::string data_str = data_stream.str();
   opcode.data.assign(data_str.begin(), data_str.end());
-  
+
   opcodes_.push_back(opcode);
 }
 
@@ -2933,20 +2862,20 @@ void OpcodeList::AddFixBadPixelsList(const FixBadPixelsParams& params) {
   opcode.id = OPCODE_FIX_BAD_PIXELS_LIST;
   opcode.version[0] = 1; opcode.version[1] = 3; opcode.version[2] = 0; opcode.version[3] = 0;
   opcode.flags = 0;
-  
+
   std::ostringstream data_stream;
-  
+
   // Write parameters (big-endian)
   Write4(params.bayer_phase, &data_stream, true);
   Write4(static_cast<unsigned int>(params.bad_pixels.size()), &data_stream, true);
   Write4(static_cast<unsigned int>(params.bad_rects.size()), &data_stream, true);
-  
+
   // Write bad pixels
   for (const auto& pixel : params.bad_pixels) {
     Write4(pixel.row, &data_stream, true);
     Write4(pixel.column, &data_stream, true);
   }
-  
+
   // Write bad rectangles
   for (const auto& rect : params.bad_rects) {
     Write4(rect.top, &data_stream, true);
@@ -2954,10 +2883,10 @@ void OpcodeList::AddFixBadPixelsList(const FixBadPixelsParams& params) {
     Write4(rect.bottom, &data_stream, true);
     Write4(rect.right, &data_stream, true);
   }
-  
+
   std::string data_str = data_stream.str();
   opcode.data.assign(data_str.begin(), data_str.end());
-  
+
   opcodes_.push_back(opcode);
 }
 
@@ -2967,48 +2896,48 @@ void OpcodeList::AddGainMap(const GainMapParams& params) {
   // DNG version 1.3.0.0
   opcode.version[0] = 1; opcode.version[1] = 3; opcode.version[2] = 0; opcode.version[3] = 0;
   opcode.flags = 0;
-  
+
   std::ostringstream data_stream;
-  
+
   // Write area of interest (LONG: top, left, bottom, right)
   Write4(params.top, &data_stream, true);
   Write4(params.left, &data_stream, true);
   Write4(params.bottom, &data_stream, true);
   Write4(params.right, &data_stream, true);
-  
+
   // Write plane info (LONG: plane, planes)
   Write4(params.plane, &data_stream, true);
   Write4(params.planes, &data_stream, true);
-  
+
   // Write pitch (LONG: row_pitch, col_pitch)
   Write4(params.row_pitch, &data_stream, true);
   Write4(params.col_pitch, &data_stream, true);
-  
+
   // Write map dimensions (LONG: map_points_v, map_points_h)
   Write4(params.map_points_v, &data_stream, true);
   Write4(params.map_points_h, &data_stream, true);
-  
+
   // Write spacing (DOUBLE: map_spacing_v, map_spacing_h)
   WriteDouble(params.map_spacing_v, &data_stream, true);
   WriteDouble(params.map_spacing_h, &data_stream, true);
-  
+
   // Write origin (DOUBLE: map_origin_v, map_origin_h)
   WriteDouble(params.map_origin_v, &data_stream, true);
   WriteDouble(params.map_origin_h, &data_stream, true);
-  
+
   // Write map planes (LONG: map_planes)
   Write4(params.map_planes, &data_stream, true);
-  
+
   // Write gain map data (FLOAT array)
   // For each MapPointsV, for each MapPointsH, for each MapPlanes: MapGain (FLOAT)
   size_t expected_size = params.map_points_v * params.map_points_h * params.map_planes;
   for (size_t i = 0; i < params.gain_data.size() && i < expected_size; i++) {
     WriteFloat(params.gain_data[i], &data_stream, true);
   }
-  
+
   std::string data_str = data_stream.str();
   opcode.data.assign(data_str.begin(), data_str.end());
-  
+
   opcodes_.push_back(opcode);
 }
 
@@ -3016,31 +2945,31 @@ std::vector<unsigned char> OpcodeList::Serialize() const {
   if (opcodes_.empty()) {
     return std::vector<unsigned char>();
   }
-  
+
   std::ostringstream stream;
-  
+
   // Write opcode count (big-endian, 32-bit uint)
   Write4(static_cast<unsigned int>(opcodes_.size()), &stream, true);
-  
+
   for (const auto& opcode : opcodes_) {
     // Write opcode ID (32-bit uint)
     Write4(opcode.id, &stream, true);
-    
+
     // Write DNG version as single 32-bit value (e.g., 0x01030000 for version 1.3.0.0)
-    unsigned int dng_version = (opcode.version[0] << 24) | (opcode.version[1] << 16) | 
+    unsigned int dng_version = (opcode.version[0] << 24) | (opcode.version[1] << 16) |
                                (opcode.version[2] << 8) | opcode.version[3];
     Write4(dng_version, &stream, true);
-    
+
     // Write flags (32-bit uint)
     Write4(opcode.flags, &stream, true);
-    
+
     // Write data size (32-bit uint)
     Write4(static_cast<unsigned int>(opcode.data.size()), &stream, true);
-    
+
     // Write opcode data
     stream.write(reinterpret_cast<const char*>(opcode.data.data()), opcode.data.size());
   }
-  
+
   std::string data_str = stream.str();
   return std::vector<unsigned char>(data_str.begin(), data_str.end());
 }
@@ -3051,11 +2980,11 @@ bool DNGImage::SetOpcodeList1(const OpcodeList& opcode_list) {
   if (opcode_list.IsEmpty()) {
     return true; // Empty opcode list is valid
   }
-  
+
   std::vector<unsigned char> data = opcode_list.Serialize();
-  
+
   bool ret = WriteTIFFTag(
-      static_cast<unsigned short>(TIFFTAG_OPCODE_LIST1), TIFF_UNDEFINED, 
+      static_cast<unsigned short>(TIFFTAG_OPCODE_LIST1), TIFF_UNDEFINED,
       static_cast<unsigned int>(data.size()),
       data.data(), &ifd_tags_, &data_os_);
 
@@ -3072,11 +3001,11 @@ bool DNGImage::SetOpcodeList2(const OpcodeList& opcode_list) {
   if (opcode_list.IsEmpty()) {
     return true; // Empty opcode list is valid
   }
-  
+
   std::vector<unsigned char> data = opcode_list.Serialize();
-  
+
   bool ret = WriteTIFFTag(
-      static_cast<unsigned short>(TIFFTAG_OPCODE_LIST2), TIFF_UNDEFINED, 
+      static_cast<unsigned short>(TIFFTAG_OPCODE_LIST2), TIFF_UNDEFINED,
       static_cast<unsigned int>(data.size()),
       data.data(), &ifd_tags_, &data_os_);
 
@@ -3093,11 +3022,11 @@ bool DNGImage::SetOpcodeList3(const OpcodeList& opcode_list) {
   if (opcode_list.IsEmpty()) {
     return true; // Empty opcode list is valid
   }
-  
+
   std::vector<unsigned char> data = opcode_list.Serialize();
-  
+
   bool ret = WriteTIFFTag(
-      static_cast<unsigned short>(TIFFTAG_OPCODE_LIST3), TIFF_UNDEFINED, 
+      static_cast<unsigned short>(TIFFTAG_OPCODE_LIST3), TIFF_UNDEFINED,
       static_cast<unsigned int>(data.size()),
       data.data(), &ifd_tags_, &data_os_);
 
