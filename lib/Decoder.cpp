@@ -47,14 +47,20 @@ namespace motioncam {
             Item audioDataItem{};
             read(f, &audioDataItem, sizeof(Item));
             
-            if(audioDataItem.type != Type::AUDIO_DATA)
+            // Determine format from item type
+            if(audioDataItem.type == Type::AUDIO_DATA_F32) {
+                outChunk.format = AudioSampleFormat::Float32;
+                outChunk.float32Data.resize(audioDataItem.size / sizeof(float));
+                read(f, (void*)outChunk.float32Data.data(), audioDataItem.size);
+            } 
+            else if(audioDataItem.type == Type::AUDIO_DATA) {
+                outChunk.format = AudioSampleFormat::Int16;
+                outChunk.int16Data.resize(audioDataItem.size / sizeof(int16_t));
+                read(f, (void*)outChunk.int16Data.data(), audioDataItem.size);
+            } 
+            else {
                 throw IOException("Invalid audio data");
-            
-            // Read into temporary buffer
-            std::vector<int16_t> tmp;
-
-            tmp.resize((audioDataItem.size + 1) / 2);
-            read(f, (void*)tmp.data(), audioDataItem.size);
+            }
 
             // Metadata should follow (this was added later so some files may not have it)
             Item audioMetadataItem{};
@@ -69,7 +75,7 @@ namespace motioncam {
                 audioTimestamp = metadata.timestampNs;
             }
         
-            outChunk = std::make_pair(audioTimestamp, std::move(tmp));
+            outChunk.timestamp = audioTimestamp;
             
             return true;
         }
@@ -327,7 +333,7 @@ namespace motioncam {
                 break;
             
             // Skip things we don't need
-            if(item.type == Type::BUFFER || item.type == Type::METADATA || item.type == Type::AUDIO_DATA || item.type == Type::AUDIO_DATA_METADATA) {
+            if(item.type == Type::BUFFER || item.type == Type::METADATA || item.type == Type::AUDIO_DATA || item.type == Type::AUDIO_DATA_F32 || item.type == Type::AUDIO_DATA_METADATA) {
                 if(FSEEK(mFile, item.size, SEEK_CUR) != 0)
                     break;
             }

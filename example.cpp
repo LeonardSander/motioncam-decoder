@@ -29,27 +29,59 @@ void writeAudio(
     const int numChannels,
     std::vector<motioncam::AudioChunk>& audioChunks)
 {
-    AudioFile<int16_t> audio;
+    if(audioChunks.empty())
+        return;
+        
+    motioncam::AudioSampleFormat format = audioChunks[0].format;
     
-    audio.setNumChannels(numChannels);
-    audio.setSampleRate(sampleRateHz);
-    
-    if(numChannels == 2) {
-        for(auto& x : audioChunks) {
-            for(auto i = 0; i < x.second.size(); i+=2) {
-                audio.samples[0].push_back(x.second[i]);
-                audio.samples[1].push_back(x.second[i+1]);
+    if(format == motioncam::AudioSampleFormat::Float32) {
+        // Write float32 audio
+        AudioFile<float> audio;
+        
+        audio.setNumChannels(numChannels);
+        audio.setSampleRate(sampleRateHz);
+        
+        if(numChannels == 2) {
+            for(auto& x : audioChunks) {
+                for(size_t i = 0; i < x.float32Data.size(); i+=2) {
+                    audio.samples[0].push_back(x.float32Data[i]);
+                    audio.samples[1].push_back(x.float32Data[i+1]);
+                }
             }
         }
-    }
-    else if(numChannels == 1) {
-        for(auto& x : audioChunks) {
-            for(auto i = 0; i < x.second.size(); i++)
-                audio.samples[0].push_back(x.second[i]);
+        else if(numChannels == 1) {
+            for(auto& x : audioChunks) {
+                for(size_t i = 0; i < x.float32Data.size(); i++)
+                    audio.samples[0].push_back(x.float32Data[i]);
+            }
         }
+        
+        audio.save(outputPath);
     }
-    
-    audio.save(outputPath);
+    else {
+        // Write int16 audio (legacy format)
+        AudioFile<int16_t> audio;
+        
+        audio.setNumChannels(numChannels);
+        audio.setSampleRate(sampleRateHz);
+        
+        if(numChannels == 2) {
+            for(auto& x : audioChunks) {
+                for(size_t i = 0; i < x.int16Data.size(); i+=2) {
+                    audio.samples[0].push_back(x.int16Data[i]);
+                    audio.samples[1].push_back(x.int16Data[i+1]);
+                }
+            }
+        }
+        else if(numChannels == 1) {
+            for(auto& x : audioChunks) {
+                for(size_t i = 0; i < x.int16Data.size(); i++)
+                    audio.samples[0].push_back(x.int16Data[i]);
+            }
+        }
+        
+        audio.save(outputPath);
+    }
 }
 
 void writeDng(
