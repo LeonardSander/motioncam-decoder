@@ -823,10 +823,9 @@ static bool CompressJPEGLossless(const unsigned char* input, size_t input_size,
     return false;
   }
 
-  // lj92 only supports single component (grayscale) images
-  if (components != 1) {
+  if (components < 1 || components > 4) {
     if (err) {
-      *err = "lj92 only supports single component images";
+      *err = "Lossless JPEG component count must be between 1 and 4";
     }
     return false;
   }
@@ -839,7 +838,7 @@ static bool CompressJPEGLossless(const unsigned char* input, size_t input_size,
   }
 
   // Convert input to uint16_t array
-  int pixel_count = width * height;
+  int pixel_count = width * height * components;
   if (pixel_count <= 0 ||
       input_size != static_cast<size_t>(pixel_count) * sizeof(uint16_t)) {
     if (err) {
@@ -900,7 +899,8 @@ static bool CompressJPEGLossless(const unsigned char* input, size_t input_size,
     width,
     height,
     optimal_bits,  // Use optimal bit depth for maximum compression
-    width,         // readLength (full width)
+    components,
+    width * components, // readLength (full interleaved row, in samples)
     0,             // skipLength (no skip)
     nullptr,       // delinearize (none - handled by preprocessing)
     0,             // delinearizeLength

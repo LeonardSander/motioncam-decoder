@@ -534,7 +534,7 @@ static int parseScan(ljp* self) {
     int compcount = self->data[self->ix+2];
     int pred = self->data[self->ix+3+2*compcount];
     if (pred<0 || pred>7) return ret;
-    if (pred==6) return parsePred6(self); // Fast path
+    if (pred==6 && self->components == 1) return parsePred6(self); // Fast path
     self->ix += BEH(self->data[self->ix]);
     self->cnt = 0;
     self->b = 0;
@@ -559,6 +559,7 @@ static int parseScan(ljp* self) {
                     Px = lastrow[c];  // Use value above for first pixel in row
                 } else {
                     int prev_colx = (col - 1) * self->components;
+                    left = thisrow[prev_colx + c];
    
                     switch (pred) {
                         case 0:
@@ -589,8 +590,7 @@ static int parseScan(ljp* self) {
                 }
                 
                 diff = nextdiff(self);
-                left = Px + diff;
-                left = (u16) (left%65536);
+                left = (u16)((Px + diff)%65536);
                 //printf("%d %d %d\n",c,diff,left);
                 int linear;
                 if (self->linearize) {
@@ -688,7 +688,7 @@ int lj92_open(lj92* lj,
         else {
             self->rowcache = rowcache;
             self->outrow[0] = rowcache;
-            self->outrow[1] = &rowcache[self->x];
+            self->outrow[1] = &rowcache[self->x * self->components];
         }
     }
 
@@ -735,6 +735,7 @@ typedef struct _lje {
     int width;
     int height;
     int bitdepth;
+    int components;
     int readLength;
     int skipLength;
     uint16_t* delinearize;
@@ -754,12 +755,13 @@ int frequencyScan(lje* self) {
     // Scan through the tile using the standard type 6 prediction
     // Need to cache the previous 2 row in target coordinates because of tiling
     uint16_t* pixel = self->image;
-    int pixcount = self->width*self->height;
+    int pixcount = self->width*self->height*self->components;
     int scan = self->readLength;
-    uint16_t* rowcache = (uint16_t*)calloc(1,self->width*4);
+    const int rowSamples = self->width * self->components;
+    uint16_t* rowcache = (uint16_t*)calloc(2 * rowSamples, sizeof(uint16_t));
     uint16_t* rows[2];
     rows[0] = rowcache;
-    rows[1] = &rowcache[self->width];
+    rows[1] = &rowcache[rowSamples];
 
     int col = 0;
     int row = 0;
@@ -781,16 +783,19 @@ int frequencyScan(lje* self) {
             free(rowcache);
             return LJ92_ERROR_TOO_WIDE;
         } */
+        const int component = col % self->components;
+        const int pixelColumn = col / self->components;
         rows[1][col] = p;
 
-        if ((row == 0)&&(col == 0))
+        if (row == 0 && pixelColumn == 0)
             Px = 1 << (self->bitdepth-1);
         else if (row == 0)
-            Px = rows[1][col-1];
-        else if (col == 0)
-            Px = rows[0][col];
+            Px = rows[1][col-self->components];
+        else if (pixelColumn == 0)
+            Px = rows[0][component];
         else
-            Px = rows[0][col] + ((rows[1][col-1] - rows[0][col-1])>>1);
+            Px = rows[0][col] + ((rows[1][col-self->components] -
+                                  rows[0][col-self->components])>>1);
         diff = rows[1][col] - Px;
         diff = diff%65536;
         diff = (int16_t)diff;
@@ -801,7 +806,7 @@ int frequencyScan(lje* self) {
         scan--;
         col++;
         if (scan==0) { pixel += self->skipLength; scan = self->readLength; }
-        if (col==self->width) {
+        if (col==rowSamples) {
             uint16_t* tmprow = rows[1];
             rows[1] = rows[0];
             rows[0] = tmprow;
@@ -822,7 +827,7 @@ void createEncodeTable(lje* self) {
     int others[18];
 
     // Calculate frequencies
-    float totalpixels = self->width * self->height;
+    float totalpixels = self->width * self->height * self->components;
     for (int i=0;i<17;i++) {
         freq[i] = (float)(self->hist[i])/totalpixels;
 #ifdef DEBUG
@@ -1017,20 +1022,26 @@ void writeHeader(lje* self) {
         }
     e[w++] = 0xff; e[w++] = 0xc3; //SOF3
         // Write SOF
-        e[w++] = 0x0; e[w++] = 11; //Lf, frame header length
+        int sofLength = 8 + 3 * self->components;
+        e[w++] = sofLength >> 8; e[w++] = sofLength & 0xff;
         e[w++] = self->bitdepth;
         e[w++] = self->height>>8; e[w++] = self->height&0xFF;
         e[w++] = self->width>>8; e[w++] = self->width&0xFF;
-        e[w++] = 1; // Components
-        e[w++] = 0; // Component ID
-        e[w++] = 0x11; // Component X/Y
-        e[w++] = 0; // Unused (Quantisation)
+        e[w++] = self->components;
+        for (int component = 0; component < self->components; ++component) {
+            e[w++] = component;
+            e[w++] = 0x11;
+            e[w++] = 0;
+        }
     e[w++] = 0xff; e[w++] = 0xda; //SCAN
     // Write SCAN
-        e[w++] = 0x0; e[w++] = 8; //Ls, scan header length
-        e[w++] = 1; // Components
-        e[w++] = 0; //
-        e[w++] = 0; //
+        int scanLength = 6 + 2 * self->components;
+        e[w++] = scanLength >> 8; e[w++] = scanLength & 0xff;
+        e[w++] = self->components;
+        for (int component = 0; component < self->components; ++component) {
+            e[w++] = component;
+            e[w++] = 0;
+        }
         e[w++] = 6; // Predictor
         e[w++] = 0; //
         e[w++] = 0; //
@@ -1048,12 +1059,13 @@ int writeBody(lje* self) {
     // Scan through the tile using the standard type 6 prediction
     // Need to cache the previous 2 row in target coordinates because of tiling
     uint16_t* pixel = self->image;
-    int pixcount = self->width*self->height;
+    int pixcount = self->width*self->height*self->components;
     int scan = self->readLength;
-    uint16_t* rowcache = (uint16_t*)calloc(1,self->width*4);
+    const int rowSamples = self->width * self->components;
+    uint16_t* rowcache = (uint16_t*)calloc(2 * rowSamples, sizeof(uint16_t));
     uint16_t* rows[2];
     rows[0] = rowcache;
-    rows[1] = &rowcache[self->width];
+    rows[1] = &rowcache[rowSamples];
 
     int col = 0;
     int row = 0;
@@ -1067,16 +1079,19 @@ int writeBody(lje* self) {
     while (pixcount--) {
         uint16_t p = *pixel;
         if (self->delinearize) p = self->delinearize[p];
+        const int component = col % self->components;
+        const int pixelColumn = col / self->components;
         rows[1][col] = p;
 
-        if ((row == 0)&&(col == 0))
+        if (row == 0 && pixelColumn == 0)
             Px = 1 << (self->bitdepth-1);
         else if (row == 0)
-            Px = rows[1][col-1];
-        else if (col == 0)
-            Px = rows[0][col];
+            Px = rows[1][col-self->components];
+        else if (pixelColumn == 0)
+            Px = rows[0][component];
         else
-            Px = rows[0][col] + ((rows[1][col-1] - rows[0][col-1])>>1);
+            Px = rows[0][col] + ((rows[1][col-self->components] -
+                                  rows[0][col-self->components])>>1);
         diff = rows[1][col] - Px;
         diff = diff%65536;
         diff = (int16_t)diff;
@@ -1148,7 +1163,7 @@ int writeBody(lje* self) {
         scan--;
         col++;
         if (scan==0) { pixel += self->skipLength; scan = self->readLength; }
-        if (col==self->width) {
+        if (col==rowSamples) {
             uint16_t* tmprow = rows[1];
             rows[1] = rows[0];
             rows[0] = tmprow;
@@ -1177,7 +1192,7 @@ int writeBody(lje* self) {
  * Read tile from an image and encode in one shot
  * Return the encoded data
  */
-int lj92_encode(uint16_t* image, int width, int height, int bitdepth,
+int lj92_encode(uint16_t* image, int width, int height, int bitdepth, int components,
                 int readLength, int skipLength,
                 uint16_t* delinearize,int delinearizeLength,
                 uint8_t** encoded, int* encodedLength) {
@@ -1185,15 +1200,20 @@ int lj92_encode(uint16_t* image, int width, int height, int bitdepth,
 
     lje* self = (lje*)calloc(sizeof(lje),1);
     if (self==NULL) return LJ92_ERROR_NO_MEMORY;
+    if (components < 1 || components > 4) {
+        free(self);
+        return LJ92_ERROR_ENCODER;
+    }
     self->image = image;
     self->width = width;
     self->height = height;
     self->bitdepth = bitdepth;
+    self->components = components;
     self->readLength = readLength;
     self->skipLength = skipLength;
     self->delinearize = delinearize;
     self->delinearizeLength = delinearizeLength;
-    self->encodedLength = width*height*3+200;
+    self->encodedLength = width*height*components*3+256;
     self->encoded = malloc(self->encodedLength);
     if (self->encoded==NULL) { free(self); return LJ92_ERROR_NO_MEMORY; }
     // Scan through data to gather frequencies of ssss prefixes
