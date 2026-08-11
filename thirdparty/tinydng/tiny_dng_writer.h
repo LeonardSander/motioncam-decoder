@@ -2928,11 +2928,20 @@ void OpcodeList::AddGainMap(const GainMapParams& params) {
   // Write map planes (LONG: map_planes)
   Write4(params.map_planes, &data_stream, true);
 
-  // Write gain map data (FLOAT array)
-  // For each MapPointsV, for each MapPointsH, for each MapPlanes: MapGain (FLOAT)
+  // GainMapParams stores planes contiguously for convenient construction.
+  // DNG requires samples interleaved as row, column, plane on disk.
   size_t expected_size = params.map_points_v * params.map_points_h * params.map_planes;
-  for (size_t i = 0; i < params.gain_data.size() && i < expected_size; i++) {
-    WriteFloat(params.gain_data[i], &data_stream, true);
+  if (params.gain_data.size() != expected_size) {
+    return;
+  }
+  const size_t plane_size = params.map_points_v * params.map_points_h;
+  for (size_t v = 0; v < params.map_points_v; ++v) {
+    for (size_t h = 0; h < params.map_points_h; ++h) {
+      for (size_t p = 0; p < params.map_planes; ++p) {
+        WriteFloat(params.gain_data[p * plane_size + v * params.map_points_h + h],
+                   &data_stream, true);
+      }
+    }
   }
 
   std::string data_str = data_stream.str();
