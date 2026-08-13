@@ -30,6 +30,11 @@ THE SOFTWARE.
 #define TINY_DNG_WRITER_H_
 
 #include <sstream>
+
+#ifdef TINY_DNG_ENABLE_JPEG_XL
+#include <jxl/encode.h>
+#include <jxl/color_encoding.h>
+#endif
 #include <vector>
 
 // Enable JPEG compression by default (using lj92 for true lossless)
@@ -204,7 +209,8 @@ static const int PLANARCONFIG_SEPARATE = 2;
 enum CompressionType : int {
   COMPRESSION_NONE = 1,
   COMPRESSION_JPEG = 7,       // JPEG compression (lossy or lossless)
-  COMPRESSION_DEFLATE = 8     // ZIP/Deflate compression
+  COMPRESSION_DEFLATE = 8,    // ZIP/Deflate compression
+  COMPRESSION_JPEG_XL = 52546 // JPEG XL (DNG 1.7)
 };
 
 // ORIENTATION
@@ -335,6 +341,7 @@ class DNGImage {
   bool SetPlanarConfig(unsigned short value);
   bool SetOrientation(unsigned short value);
   bool SetCompression(unsigned short value);
+  bool SetJXLDistance(float distance);
   bool SetPredictor(unsigned short value);    //untested
   bool SetSampleFormat(const unsigned int num_samples,
                        const unsigned short *values);
@@ -498,6 +505,7 @@ class DNGImage {
   unsigned int samples_per_pixels_;
   std::vector<unsigned short> bits_per_samples_;
   unsigned short compression_type_{COMPRESSION_NONE};
+  float jxl_distance_{0.0f};
 
   // Image dimensions (needed for JPEG compression)
   unsigned int image_width_{0};
@@ -940,6 +948,93 @@ static bool CompressJPEGLossless(const unsigned char* input, size_t input_size,
 #endif
 }
 
+// Encode one raw DNG strip as a headerless JPEG XL codestream. DNG 1.7 uses
+// uint16 output buffers for JPEG XL even when the sensor's meaningful range is
+// smaller; black/white-level tags retain that range without rescaling samples.
+static bool CompressJPEGXL(const unsigned char* input, size_t input_size,
+                           int width, int height, int components, float distance,
+                           std::vector<unsigned char>& output, std::string* err) {
+#ifdef TINY_DNG_ENABLE_JPEG_XL
+  const size_t sample_count = static_cast<size_t>(width) * height * components;
+  if (!input || width <= 0 || height <= 0 || (components != 1 && components != 3) ||
+      input_size != sample_count * sizeof(uint16_t) || distance < 0.0f) {
+    if (err) *err = "Invalid JPEG XL input";
+    return false;
+  }
+
+  JxlEncoder* encoder = JxlEncoderCreate(nullptr);
+  if (!encoder) {
+    if (err) *err = "Could not create JPEG XL encoder";
+    return false;
+  }
+  auto fail = [&](const char* message) {
+    if (err) *err = message;
+    JxlEncoderDestroy(encoder);
+    return false;
+  };
+
+  // TIFF/DNG stores a bare codestream in each strip/tile, not a .jxl container.
+  JxlBasicInfo info;
+  JxlEncoderInitBasicInfo(&info);
+  info.xsize = static_cast<uint32_t>(width);
+  info.ysize = static_cast<uint32_t>(height);
+  info.bits_per_sample = 16;
+  info.exponent_bits_per_sample = 0;
+  info.num_color_channels = static_cast<uint32_t>(components);
+  info.uses_original_profile = JXL_TRUE;
+  if (JxlEncoderSetBasicInfo(encoder, &info) != JXL_ENC_SUCCESS)
+    return fail("Could not set JPEG XL basic info");
+
+  JxlColorEncoding color;
+  JxlColorEncodingSetToLinearSRGB(&color, components == 1 ? JXL_TRUE : JXL_FALSE);
+  if (JxlEncoderSetColorEncoding(encoder, &color) != JXL_ENC_SUCCESS)
+    return fail("Could not set JPEG XL color encoding");
+
+  JxlEncoderFrameSettings* frame = JxlEncoderFrameSettingsCreate(encoder, nullptr);
+  if (!frame) return fail("Could not create JPEG XL frame settings");
+  if (JxlEncoderFrameSettingsSetOption(frame, JXL_ENC_FRAME_SETTING_EFFORT, 7) != JXL_ENC_SUCCESS)
+    return fail("Could not set JPEG XL effort");
+  // Modular mode is essential for lossless and is deliberately retained for
+  // lossy raw data. It supports both scalar CFA planes and interleaved
+  // three-channel LinearRaw without a display-referred XYB conversion.
+  if (JxlEncoderFrameSettingsSetOption(frame, JXL_ENC_FRAME_SETTING_MODULAR, 1) != JXL_ENC_SUCCESS)
+    return fail("Could not enable JPEG XL modular mode");
+  if (distance == 0.0f) {
+    if (JxlEncoderSetFrameLossless(frame, JXL_TRUE) != JXL_ENC_SUCCESS)
+      return fail("Could not enable lossless JPEG XL");
+  } else if (JxlEncoderSetFrameDistance(frame, distance) != JXL_ENC_SUCCESS) {
+    return fail("Could not set lossy JPEG XL distance");
+  }
+
+  const JxlPixelFormat format = {
+      static_cast<uint32_t>(components), JXL_TYPE_UINT16, JXL_NATIVE_ENDIAN, 0};
+  if (JxlEncoderAddImageFrame(frame, &format, input, input_size) != JXL_ENC_SUCCESS)
+    return fail("Could not add JPEG XL image frame");
+  JxlEncoderCloseInput(encoder);
+
+  output.resize(std::max<size_t>(4096, input_size / 2));
+  uint8_t* next = output.data();
+  size_t available = output.size();
+  for (;;) {
+    const JxlEncoderStatus status = JxlEncoderProcessOutput(encoder, &next, &available);
+    if (status == JXL_ENC_SUCCESS) break;
+    if (status != JXL_ENC_NEED_MORE_OUTPUT)
+      return fail("JPEG XL encoding failed");
+    const size_t used = static_cast<size_t>(next - output.data());
+    output.resize(output.size() * 2);
+    next = output.data() + used;
+    available = output.size() - used;
+  }
+  output.resize(static_cast<size_t>(next - output.data()));
+  JxlEncoderDestroy(encoder);
+  return !output.empty();
+#else
+  (void)input; (void)input_size; (void)width; (void)height; (void)components; (void)distance; (void)output;
+  if (err) *err = "JPEG XL compression not enabled. Define TINY_DNG_ENABLE_JPEG_XL and link libjxl.";
+  return false;
+#endif
+}
+
 // Note: CompressJPEGLossy removed - lj92 only supports lossless compression
 
 static void Write1(const unsigned char c, std::ostringstream *out) {
@@ -1064,6 +1159,10 @@ DNGImage::DNGImage()
     : dng_big_endian_(true),
       num_fields_(0),
       samples_per_pixels_(0),
+      compression_type_(COMPRESSION_NONE),
+      jxl_distance_(0.0f),
+      image_width_(0),
+      image_height_(0),
       data_strip_offset_{0},
       data_strip_bytes_{0} {
   swap_endian_ = (IsBigEndian() != dng_big_endian_);
@@ -1296,7 +1395,8 @@ bool DNGImage::SetPlanarConfig(const unsigned short value) {
 bool DNGImage::SetCompression(const unsigned short value) {
   unsigned int count = 1;
 
-  if ((value == COMPRESSION_NONE) || (value == COMPRESSION_JPEG) || (value == COMPRESSION_DEFLATE)) {
+  if ((value == COMPRESSION_NONE) || (value == COMPRESSION_JPEG) ||
+      (value == COMPRESSION_DEFLATE) || (value == COMPRESSION_JPEG_XL)) {
     // OK
   } else {
     err_ += "ERROR: SetCompression called with invalid value: " + std::to_string(value) + "\n";
@@ -1315,6 +1415,15 @@ bool DNGImage::SetCompression(const unsigned short value) {
   }
 
   num_fields_++;
+  return true;
+}
+
+bool DNGImage::SetJXLDistance(float distance) {
+  if (!std::isfinite(distance) || distance < 0.0f || distance > 6.0f) {
+    err_ += "ERROR: JPEG XL distance must be between 0 and 6\n";
+    return false;
+  }
+  jxl_distance_ = distance;
   return true;
 }
 
@@ -1643,12 +1752,23 @@ bool DNGImage::SetTimeCode(unsigned char timecode[8]) {
 }
 
 bool DNGImage::SetExposureTime(float exposureSecs) {
-  float numerator, denominator;
-  if (FloatToRational(exposureSecs, &numerator, &denominator) != 0) {
-    // Couldn't represent fp value as integer rational value.
+  if (!std::isfinite(exposureSecs) || exposureSecs <= 0.0f) {
     return false;
   }
-
+  // FloatToRational may produce a power-of-two denominator of 2^32 or
+  // greater for normal shutter times. Casting that to TIFF's uint32 then
+  // becomes zero (ExposureTime=inf). A decimal nanosecond rational is both
+  // sufficiently precise and guaranteed to fit after reduction.
+  uint64_t denominator = 1000000000ULL;
+  while (exposureSecs * static_cast<double>(denominator) >
+             std::numeric_limits<uint32_t>::max() && denominator > 1)
+    denominator /= 10;
+  uint64_t numerator = static_cast<uint64_t>(
+      std::max(1.0, std::round(exposureSecs * static_cast<double>(denominator))));
+  uint64_t a = numerator, b = denominator;
+  while (b) { const uint64_t remainder = a % b; a = b; b = remainder; }
+  numerator /= a;
+  denominator /= a;
   unsigned int data[2];
   data[0] = static_cast<unsigned int>(numerator);
   data[1] = static_cast<unsigned int>(denominator);
@@ -2419,6 +2539,22 @@ bool DNGImage::SetImageData(const unsigned char *data, const size_t data_len) {
       err_ += "JPEG compressed data is empty\n";
       return false;
     }
+  } else if (compression_type_ == COMPRESSION_JPEG_XL) {
+    if (image_width_ == 0 || image_height_ == 0 || bits_per_samples_.empty()) {
+      err_ += "Image dimensions and BitsPerSample must be set before JPEG XL compression\n";
+      return false;
+    }
+    if (bits_per_samples_[0] != 16) {
+      err_ += "DNG JPEG XL requires BitsPerSample=16\n";
+      return false;
+    }
+    if (!CompressJPEGXL(data, data_len, image_width_, image_height_,
+                        samples_per_pixels_, jxl_distance_, compressed_data, &err_)) {
+      err_ += "JPEG XL compression failed in SetImageData\n";
+      return false;
+    }
+    write_data = compressed_data.data();
+    write_len = compressed_data.size();
   }
   /*else if (compression_type_ == COMPRESSION_DEFLATE) {
     // Verify input data is not all zeros
