@@ -743,6 +743,7 @@ typedef struct _lje {
     uint8_t* encoded;
     int encodedWritten;
     int encodedLength;
+    int predictor;
     int hist[18]; // SSSS frequency histogram
     int bits[18];
     int huffval[18];
@@ -751,8 +752,24 @@ typedef struct _lje {
     int huffsym[18];
 } lje;
 
+static int prediction(int predictor, int left, int above, int upperLeft) {
+    switch (predictor) {
+        case 1: return left;
+        case 2: return above;
+        case 3: return upperLeft;
+        case 4: return left + above - upperLeft;
+        case 5: return left + ((above - upperLeft) >> 1);
+        case 6: return above + ((left - upperLeft) >> 1);
+        case 7: return (left + above) >> 1;
+        default: return above + ((left - upperLeft) >> 1);
+    }
+}
+
 int frequencyScan(lje* self) {
-    // Scan through the tile using the standard type 6 prediction
+    // Pick the JPEG lossless predictor that produces the fewest residual bits.
+    // Type 6 is a good general default, but can be particularly inefficient for
+    // mosaiced sensor data and made the encoded strip nearly as large as packed
+    // uncompressed data.
     // Need to cache the previous 2 row in target coordinates because of tiling
     uint16_t* pixel = self->image;
     int pixcount = self->width*self->height*self->components;
@@ -765,8 +782,8 @@ int frequencyScan(lje* self) {
 
     int col = 0;
     int row = 0;
-    int Px = 0;
-    int32_t diff = 0;
+    uint64_t costs[8] = {0};
+    int candidateHist[8][18] = {{0}};
     
     // Debug output removed
     //int maxval = (1 << self->bitdepth);
@@ -787,21 +804,22 @@ int frequencyScan(lje* self) {
         const int pixelColumn = col / self->components;
         rows[1][col] = p;
 
-        if (row == 0 && pixelColumn == 0)
-            Px = 1 << (self->bitdepth-1);
-        else if (row == 0)
-            Px = rows[1][col-self->components];
-        else if (pixelColumn == 0)
-            Px = rows[0][component];
-        else
-            Px = rows[0][col] + ((rows[1][col-self->components] -
-                                  rows[0][col-self->components])>>1);
-        diff = rows[1][col] - Px;
-        diff = diff%65536;
-        diff = (int16_t)diff;
-        int ssss = 32 - __builtin_clz(abs(diff));
-        if (diff==0) ssss=0;
-        self->hist[ssss]++;
+        for (int predictor = 1; predictor <= 7; ++predictor) {
+            int Px;
+            if (row == 0 && pixelColumn == 0)
+                Px = 1 << (self->bitdepth-1);
+            else if (row == 0)
+                Px = rows[1][col-self->components];
+            else if (pixelColumn == 0)
+                Px = rows[0][component];
+            else
+                Px = prediction(predictor, rows[1][col-self->components],
+                                rows[0][col], rows[0][col-self->components]);
+            int32_t diff = (int16_t)((rows[1][col] - Px) % 65536);
+            int ssss = diff == 0 ? 0 : 32 - __builtin_clz(abs(diff));
+            candidateHist[predictor][ssss]++;
+            costs[predictor] += ssss;
+        }
         pixel++;
         scan--;
         col++;
@@ -814,8 +832,10 @@ int frequencyScan(lje* self) {
             row++;
         }
     }
-    // Return histogram for analysis (commented out for now)
-    // The histogram determines compression efficiency
+    self->predictor = 1;
+    for (int predictor = 2; predictor <= 7; ++predictor)
+        if (costs[predictor] < costs[self->predictor]) self->predictor = predictor;
+    memcpy(self->hist, candidateHist[self->predictor], sizeof(self->hist));
     
     free(rowcache);
     return LJ92_ERROR_NONE;
@@ -1042,7 +1062,7 @@ void writeHeader(lje* self) {
             e[w++] = component;
             e[w++] = 0;
         }
-        e[w++] = 6; // Predictor
+        e[w++] = self->predictor;
         e[w++] = 0; //
         e[w++] = 0; //
     self->encodedWritten = w;
@@ -1090,8 +1110,8 @@ int writeBody(lje* self) {
         else if (pixelColumn == 0)
             Px = rows[0][component];
         else
-            Px = rows[0][col] + ((rows[1][col-self->components] -
-                                  rows[0][col-self->components])>>1);
+            Px = prediction(self->predictor, rows[1][col-self->components],
+                            rows[0][col], rows[0][col-self->components]);
         diff = rows[1][col] - Px;
         diff = diff%65536;
         diff = (int16_t)diff;
