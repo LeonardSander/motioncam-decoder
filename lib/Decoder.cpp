@@ -187,7 +187,8 @@ namespace motioncam {
         return *mAudioLoader;
     }
     
-    void Decoder::loadFrame(const Timestamp timestamp, std::vector<uint8_t>& outData, nlohmann::json& outMetadata) {
+    void Decoder::loadFrame(const Timestamp timestamp, std::vector<uint8_t>& outData,
+                            nlohmann::json& outMetadata, int widthOverride) {
         if(mFrameOffsetMap.find(timestamp) == mFrameOffsetMap.end())
             throw IOException("Frame not found (timestamp: " + std::to_string(timestamp) + ")");
         
@@ -219,7 +220,11 @@ namespace motioncam {
         std::string metadataString = std::string(metadataJson.begin(), metadataJson.end());
         outMetadata = nlohmann::json::parse(metadataString);        
         
-        const int width = outMetadata["width"];
+        const int metadataWidth = outMetadata["width"];
+        // Never discard samples when the override is narrower than metadata.
+        // The caller needs the complete decoded stream in order to reinterpret
+        // incorrect row boundaries with the requested stride.
+        const int width = widthOverride > metadataWidth ? widthOverride : metadataWidth;
         const int height = outMetadata["height"];
         const int compressionType = outMetadata["compressionType"];
                     
@@ -238,6 +243,11 @@ namespace motioncam {
         else {
             throw IOException("Invalid compression type");
         }
+
+        // Consumers using a stride override must see the decoded row width.
+        // They can subsequently crop it back to the intended visible width.
+        if (widthOverride > 0)
+            outMetadata["width"] = widthOverride;
     }
 
     void Decoder::loadFrameMetadata(const Timestamp timestamp, nlohmann::json& outMetadata) {

@@ -77,7 +77,8 @@ namespace motioncam {
         const std::vector<Timestamp>& getFrames() const;
         
         // Load a single frame and its metadata.
-        void loadFrame(const Timestamp timestamp, std::vector<uint8_t>& outData, nlohmann::json& outMetadata);
+        void loadFrame(const Timestamp timestamp, std::vector<uint8_t>& outData,
+                       nlohmann::json& outMetadata, int widthOverride = 0);
 
         // Load metadata of a single frame.
         void loadFrameMetadata(const Timestamp timestamp, nlohmann::json& outMetadata);
