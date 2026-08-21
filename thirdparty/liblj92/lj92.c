@@ -60,6 +60,7 @@ typedef struct _ljp {
     int y; // Height
     int bits; // Bit depth
     int components;  // Components(Nf)
+    u8 componentId[4];
     int writelen; // Write rows this long
     int skiplen; // Skip this many values after each row
     u16* linearize; // Linearization table
@@ -75,9 +76,11 @@ typedef struct _ljp {
     int* huffsize;
     int* huffcode;
 #else
-    u16* hufflut;
-    int huffbits;
+    u16* hufflut[4];
+    int huffbits[4];
 #endif
+    int scanHuffTable[4];
+    int decodeError;
     // Parse state
     int cnt;
     u32 b;
@@ -103,11 +106,13 @@ static int find(ljp* self) {
 static int parseHuff(ljp* self) {
     int ret = LJ92_ERROR_CORRUPT;
     u8* huffhead = &self->data[self->ix]; // xstruct.unpack('>HB16B',self.data[self.ix:self.ix+19])
+    int hufflen = BEH(huffhead[0]);
+    if (hufflen < 2 || self->ix > self->datalen - hufflen) return ret;
+#ifdef SLOW_HUFF
+    int tableId = huffhead[2] & 0x0f;
+    if (tableId != 0 || (huffhead[2] & 0xf0) != 0) return ret;
     u8* bits = &huffhead[2];
     bits[0] = 0; // Because table starts from 1
-    int hufflen = BEH(huffhead[0]);
-    if ((self->ix + hufflen) >= self->datalen) return ret;
-#ifdef SLOW_HUFF
     u8* huffval = calloc(hufflen - 19,sizeof(u8));
     if (huffval == NULL) return LJ92_ERROR_NO_MEMORY;
     self->huffval = huffval;
@@ -229,64 +234,70 @@ static int parseHuff(ljp* self) {
     self->huffcode = NULL;
     ret = LJ92_ERROR_NONE;
 #else
-    /* Calculate huffman direct lut */
-    // How many bits in the table - find highest entry
-    u8* huffvals = &self->data[self->ix+19];
-    int maxbits = 16;
-    while (maxbits>0) {
-        if (bits[maxbits]) break;
-        maxbits--;
+    int cursor = self->ix + 2;
+    const int end = self->ix + hufflen;
+    while (cursor < end) {
+        if (end - cursor < 17) return LJ92_ERROR_CORRUPT;
+        const int selector = self->data[cursor++];
+        const int tableId = selector & 0x0f;
+        if (tableId >= 4 || (selector & 0xf0) != 0) return LJ92_ERROR_CORRUPT;
+        u8* bits = &self->data[cursor];
+        int valueCount = 0;
+        int maxbits = 0;
+        for (int i = 0; i < 16; ++i) {
+            valueCount += bits[i];
+            if (bits[i]) maxbits = i + 1;
+        }
+        cursor += 16;
+        if (!maxbits || valueCount > end - cursor) return LJ92_ERROR_CORRUPT;
+        u8* huffvals = &self->data[cursor];
+        u16* hufflut = calloc(1u << maxbits, sizeof(u16));
+        if (hufflut == NULL) return LJ92_ERROR_NO_MEMORY;
+        int output = 0;
+        int value = 0;
+        for (int bitLength = 1; bitLength <= maxbits; ++bitLength) {
+            for (int code = 0; code < bits[bitLength - 1]; ++code, ++value) {
+                const int repetitions = 1 << (maxbits - bitLength);
+                if (output > (1 << maxbits) - repetitions) {
+                    free(hufflut);
+                    return LJ92_ERROR_CORRUPT;
+                }
+                for (int j = 0; j < repetitions; ++j)
+                    hufflut[output++] = (u16)((huffvals[value] << 8) | bitLength);
+            }
+        }
+        if (value != valueCount) {
+            free(hufflut);
+            return LJ92_ERROR_CORRUPT;
+        }
+        free(self->hufflut[tableId]);
+        self->hufflut[tableId] = hufflut;
+        self->huffbits[tableId] = maxbits;
+        cursor += valueCount;
     }
-    self->huffbits = maxbits;
-    /* Now fill the lut */
-    u16* hufflut = malloc((1<<maxbits) * sizeof(u16));
-    if (hufflut == NULL) return LJ92_ERROR_NO_MEMORY;
-    self->hufflut = hufflut;
-    int i = 0;
-    int hv = 0;
-    int rv = 0;
-    int vl = 0; // i
-    int hcode;
-    int bitsused = 1;
-#ifdef DEBUG
-    printf("%04x:%x:%d:%x\n",i,huffvals[hv],bitsused,1<<(maxbits-bitsused));
-#endif
-    while (i<1<<maxbits) {
-        if (bitsused>maxbits) {
-            break; // Done. Should never get here!
-        }
-        if (vl >= bits[bitsused]) {
-            bitsused++;
-            vl = 0;
-            continue;
-        }
-        if (rv == 1 << (maxbits-bitsused)) {
-            rv = 0;
-            vl++;
-            hv++;
-#ifdef DEBUG
-            printf("%04x:%x:%d:%x\n",i,huffvals[hv],bitsused,1<<(maxbits-bitsused));
-#endif
-            continue;
-        }
-        hcode = huffvals[hv];
-        hufflut[i] = hcode<<8 | bitsused;
-        //printf("%d %d %d\n",i,bitsused,hcode);
-        i++;
-        rv++;
-    }
+    self->ix = end;
     ret = LJ92_ERROR_NONE;
 #endif
     return ret;
 }
 
 static int parseSof3(ljp* self) {
-    if (self->ix+6 >= self->datalen) return LJ92_ERROR_CORRUPT;
+    if (self->ix > self->datalen - 8) return LJ92_ERROR_CORRUPT;
+    const int length = BEH(self->data[self->ix]);
+    if (length < 8 || self->ix > self->datalen - length) return LJ92_ERROR_CORRUPT;
     self->y = BEH(self->data[self->ix+3]);
     self->x = BEH(self->data[self->ix+5]);
     self->bits = self->data[self->ix+2];
     self->components = self->data[self->ix + 7];
-    self->ix += BEH(self->data[self->ix]);
+    if (self->components < 1 || self->components > 4 ||
+        length != 8 + 3 * self->components) return LJ92_ERROR_CORRUPT;
+    for (int c = 0; c < self->components; ++c) {
+        self->componentId[c] = self->data[self->ix + 8 + 3*c];
+        for (int previous = 0; previous < c; ++previous)
+            if (self->componentId[previous] == self->componentId[c])
+                return LJ92_ERROR_CORRUPT;
+    }
+    self->ix += length;
     return LJ92_ERROR_NONE;
 }
 
@@ -352,7 +363,7 @@ static int extend(ljp* self,int v,int t) {
 }
 #endif
 
-inline static int nextdiff(ljp* self) {
+inline static int nextdiff(ljp* self, int component) {
 #ifdef SLOW_HUFF
     int t = decode(self);
     int diff = receive(self,t);
@@ -360,7 +371,12 @@ inline static int nextdiff(ljp* self) {
 #else
     u32 b = self->b;
     int cnt = self->cnt;
-    int huffbits = self->huffbits;
+    int table = self->scanHuffTable[component];
+    if (table < 0 || table >= 4 || self->hufflut[table] == NULL) {
+        self->decodeError = 1;
+        return 0;
+    }
+    int huffbits = self->huffbits[table];
     int ix = self->ix;
     int next;
     while (cnt < huffbits) {
@@ -377,8 +393,12 @@ inline static int nextdiff(ljp* self) {
         } else if (two==0xFF) ix++;
     }
     int index = b >> (cnt - huffbits);
-    u16 ssssused = self->hufflut[index];
+    u16 ssssused = self->hufflut[table][index];
     int usedbits = ssssused&0xFF;
+    if (!usedbits) {
+        self->decodeError = 1;
+        return 0;
+    }
     int t = ssssused>>8;
     //self->sssshist[t]++;
     cnt -= usedbits;
@@ -444,7 +464,7 @@ static int parsePred6(ljp* self) {
     int linear;
 
     // First pixel
-    diff = nextdiff(self);
+    diff = nextdiff(self, 0);
     Px = 1 << (self->bits-1);
     left = Px + diff;
     left = (u16) (left%65536);
@@ -458,7 +478,7 @@ static int parsePred6(ljp* self) {
     --write;
     int rowcount = self->x-1;
     while (rowcount--) {
-        diff = nextdiff(self);
+        diff = nextdiff(self, 0);
         Px = left;
         left = Px + diff;
         left = (u16) (left%65536);
@@ -482,7 +502,7 @@ static int parsePred6(ljp* self) {
     //printf("%x %x\n",thisrow,lastrow);
     while (c<pixels) {
         col = 0;
-        diff = nextdiff(self);
+        diff = nextdiff(self, 0);
         Px = lastrow[col]; // Use value above for first pixel in row
         left = Px + diff;
         left = (u16) (left%65536);
@@ -501,7 +521,7 @@ static int parsePred6(ljp* self) {
             write = self->writelen;
         }
         while (rowcount--) {
-            diff = nextdiff(self);
+            diff = nextdiff(self, 0);
             Px = lastrow[col] + ((left - lastrow[col-1])>>1);
             left = Px + diff;
             left = (u16) (left%65536);
@@ -531,10 +551,39 @@ static int parseScan(ljp* self) {
     int ret = LJ92_ERROR_CORRUPT;
     //memset(self->sssshist,0,sizeof(self->sssshist));
     self->ix = self->scanstart;
+    if (self->ix > self->datalen - 3) return ret;
+    const int scanLength = BEH(self->data[self->ix]);
+    if (scanLength < 6 || self->ix > self->datalen - scanLength) return ret;
     int compcount = self->data[self->ix+2];
+    if (compcount < 1 || compcount != self->components ||
+        scanLength != 6 + 2 * compcount) return ret;
+    int scanComponent[4];
+    for (int c = 0; c < compcount; ++c) {
+        const int selectorId = self->data[self->ix + 3 + 2*c];
+        scanComponent[c] = -1;
+        for (int frameComponent = 0; frameComponent < self->components; ++frameComponent)
+            if (self->componentId[frameComponent] == selectorId) {
+                scanComponent[c] = frameComponent;
+                break;
+            }
+        if (scanComponent[c] < 0) return ret;
+        for (int previous = 0; previous < c; ++previous)
+            if (scanComponent[previous] == scanComponent[c]) return ret;
+        const int selector = self->data[self->ix + 4 + 2*c];
+        if ((selector & 0x0f) != 0) return ret;
+        self->scanHuffTable[c] = selector >> 4;
+    }
+#ifndef SLOW_HUFF
+    for (int c = 0; c < compcount; ++c)
+        if (self->scanHuffTable[c] < 0 || self->scanHuffTable[c] >= 4 ||
+            self->hufflut[self->scanHuffTable[c]] == NULL) return ret;
+#endif
     int pred = self->data[self->ix+3+2*compcount];
     if (pred<0 || pred>7) return ret;
-    if (pred==6 && self->components == 1) return parsePred6(self); // Fast path
+    if (pred==6 && self->components == 1) {
+        ret = parsePred6(self); // Fast path
+        return self->decodeError ? LJ92_ERROR_CORRUPT : ret;
+    }
     self->ix += BEH(self->data[self->ix]);
     self->cnt = 0;
     self->b = 0;
@@ -550,46 +599,47 @@ static int parseScan(ljp* self) {
         for (int col = 0; col < self->x; col++) {
             int colx = col * self->components;
             for (int c = 0; c < self->components; c++) {
+                const int component = scanComponent[c];
                 if ((col==0)&&(row==0)) {
                     Px = 1 << (self->bits-1);
                 } else if (row==0) {
                     // Px = left;
-                    Px = thisrow[(col - 1) * self->components + c];
+                    Px = thisrow[(col - 1) * self->components + component];
                 } else if (col==0) {
-                    Px = lastrow[c];  // Use value above for first pixel in row
+                    Px = lastrow[component];  // Use value above for first pixel in row
                 } else {
                     int prev_colx = (col - 1) * self->components;
-                    left = thisrow[prev_colx + c];
+                    left = thisrow[prev_colx + component];
    
                     switch (pred) {
                         case 0:
                           Px = 0;
                           break;  // No prediction... should not be used
                         case 1:
-                          Px = thisrow[prev_colx + c];
+                          Px = thisrow[prev_colx + component];
                           break;
                         case 2:
-                          Px = lastrow[colx + c];
+                          Px = lastrow[colx + component];
                           break;
                         case 3:
-                          Px = lastrow[prev_colx + c];
+                          Px = lastrow[prev_colx + component];
                           break;
                         case 4:
-                          Px = left + lastrow[colx + c] - lastrow[prev_colx + c];
+                          Px = left + lastrow[colx + component] - lastrow[prev_colx + component];
                           break;
                         case 5:
-                          Px = left + ((lastrow[colx + c] - lastrow[prev_colx + c]) >> 1);
+                          Px = left + ((lastrow[colx + component] - lastrow[prev_colx + component]) >> 1);
                           break;
                         case 6:
-                          Px = lastrow[colx + c] + ((left - lastrow[prev_colx + c]) >> 1);
+                          Px = lastrow[colx + component] + ((left - lastrow[prev_colx + component]) >> 1);
                           break;
                         case 7:
-                          Px = (left + lastrow[colx + c]) >> 1;
+                          Px = (left + lastrow[colx + component]) >> 1;
                           break;
                     }
                 }
                 
-                diff = nextdiff(self);
+                diff = nextdiff(self, c);
                 left = (u16)((Px + diff)%65536);
                 //printf("%d %d %d\n",c,diff,left);
                 int linear;
@@ -599,8 +649,8 @@ static int parseScan(ljp* self) {
                 } else
                     linear = left;
 
-                thisrow[colx + c] = left;
-                out[colx + c] = linear; // HACK
+                thisrow[colx + component] = left;
+                out[colx + component] = linear; // HACK
             } // c
         } // col
 
@@ -611,7 +661,7 @@ static int parseScan(ljp* self) {
         out += self->x * self->components + self->skiplen;
     } // row
 
-    ret = LJ92_ERROR_NONE;
+    ret = self->decodeError ? LJ92_ERROR_CORRUPT : LJ92_ERROR_NONE;
     return ret;
 }
 
@@ -663,8 +713,10 @@ static void free_memory(ljp* self) {
     free(self->huffcode);
     self->huffcode = NULL;
 #else
-    free(self->hufflut);
-    self->hufflut = NULL;
+    for (int i = 0; i < 4; ++i) {
+        free(self->hufflut[i]);
+        self->hufflut[i] = NULL;
+    }
 #endif
     free(self->rowcache);
     self->rowcache = NULL;
