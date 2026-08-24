@@ -994,11 +994,12 @@ static bool CompressJPEGXL(const unsigned char* input, size_t input_size,
   if (!frame) return fail("Could not create JPEG XL frame settings");
   if (JxlEncoderFrameSettingsSetOption(frame, JXL_ENC_FRAME_SETTING_EFFORT, 7) != JXL_ENC_SUCCESS)
     return fail("Could not set JPEG XL effort");
-  // Modular mode is essential for lossless and is deliberately retained for
-  // lossy raw data. It supports both scalar CFA planes and interleaved
-  // three-channel LinearRaw without a display-referred XYB conversion.
-  if (JxlEncoderFrameSettingsSetOption(frame, JXL_ENC_FRAME_SETTING_MODULAR, 1) != JXL_ENC_SUCCESS)
-    return fail("Could not enable JPEG XL modular mode");
+  // Modular mode is essential for bit-exact lossless raw data. Leave lossy
+  // mode selection to libjxl; forcing modular for smooth low-range raw/log
+  // samples can produce extremely small codestreams that DNG readers reject.
+  if (distance == 0.0f &&
+      JxlEncoderFrameSettingsSetOption(frame, JXL_ENC_FRAME_SETTING_MODULAR, 1) != JXL_ENC_SUCCESS)
+    return fail("Could not enable lossless JPEG XL modular mode");
   if (distance == 0.0f) {
     if (JxlEncoderSetFrameLossless(frame, JXL_TRUE) != JXL_ENC_SUCCESS)
       return fail("Could not enable lossless JPEG XL");
