@@ -3,6 +3,9 @@
 
 #include <cstdio>
 #include <cstring>
+#include <cmath>
+#include <limits>
+#include <set>
 
 #if defined(_WIN32)
     #define FSEEK _fseeki64
@@ -313,15 +316,77 @@ namespace motioncam {
     }
     
     void Decoder::reindexOffsets() {
-        // Sort offsets so they are in order of timestamps
+        // File offsets preserve capture order even when a damaged timestamp
+        // would sort a frame to the beginning or end of the clip.
         std::sort(mOffsets.begin(), mOffsets.end(), [](const auto& a, const auto&b) {
-            return a.timestamp < b.timestamp;
+            return a.offset < b.offset;
         });
+
+        // Repair isolated timestamp outliers before they reach VFR/CFR
+        // mapping. A bad clock value commonly appears as -1 or as a single
+        // enormous jump while the timestamps on either side retain the
+        // camera's normal cadence.
+        constexpr long double outlierRatio = 100.0L;
+        auto distance = [](Timestamp a, Timestamp b) {
+            return std::fabs(static_cast<long double>(a) - static_cast<long double>(b));
+        };
+        auto clampedTimestamp = [](long double value) {
+            const auto minimum = static_cast<long double>(
+                std::numeric_limits<Timestamp>::min());
+            const auto maximum = static_cast<long double>(
+                std::numeric_limits<Timestamp>::max());
+            return static_cast<Timestamp>(std::max(minimum, std::min(maximum, value)));
+        };
+        if (mOffsets.size() >= 3) {
+            const auto secondStep = distance(mOffsets[2].timestamp, mOffsets[1].timestamp);
+            if (secondStep > 0.0L &&
+                distance(mOffsets[1].timestamp, mOffsets[0].timestamp) > outlierRatio * secondStep)
+                mOffsets[0].timestamp = clampedTimestamp(
+                    2.0L * static_cast<long double>(mOffsets[1].timestamp) -
+                    static_cast<long double>(mOffsets[2].timestamp));
+
+            for (size_t index = 1; index + 1 < mOffsets.size(); ++index) {
+                const Timestamp previous = mOffsets[index - 1].timestamp;
+                const Timestamp current = mOffsets[index].timestamp;
+                const Timestamp next = mOffsets[index + 1].timestamp;
+                if (next <= previous) continue;
+                const long double localStep = distance(next, previous) / 2.0L;
+                if (localStep > 0.0L &&
+                    distance(current, previous) > outlierRatio * localStep &&
+                    distance(next, current) > outlierRatio * localStep)
+                    mOffsets[index].timestamp = clampedTimestamp(
+                        (static_cast<long double>(previous) +
+                         static_cast<long double>(next)) / 2.0L);
+            }
+
+            const size_t last = mOffsets.size() - 1;
+            const auto previousStep = distance(
+                mOffsets[last - 1].timestamp, mOffsets[last - 2].timestamp);
+            if (previousStep > 0.0L &&
+                distance(mOffsets[last].timestamp, mOffsets[last - 1].timestamp) >
+                    outlierRatio * previousStep)
+                mOffsets[last].timestamp = clampedTimestamp(
+                    2.0L * static_cast<long double>(mOffsets[last - 1].timestamp) -
+                    static_cast<long double>(mOffsets[last - 2].timestamp));
+        }
         
         mFrameList.clear();
         mFrameOffsetMap.clear();
-        
-        for(const auto& i : mOffsets) {
+
+        // Timestamp is the public frame key, so equal repaired or source
+        // timestamps must not collapse multiple physical frames into one map
+        // entry. A one-nanosecond nudge is immaterial to timing but preserves
+        // a distinct lookup key for every frame.
+        std::set<Timestamp> usedTimestamps;
+        for(auto& i : mOffsets) {
+            if(usedTimestamps.count(i.timestamp)) {
+                if(i.timestamp == std::numeric_limits<Timestamp>::max()) {
+                    do { --i.timestamp; } while(usedTimestamps.count(i.timestamp));
+                } else {
+                    do { ++i.timestamp; } while(usedTimestamps.count(i.timestamp));
+                }
+            }
+            usedTimestamps.insert(i.timestamp);
             mFrameList.push_back(i.timestamp);
             mFrameOffsetMap.insert({ i.timestamp, i });
         }
