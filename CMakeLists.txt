@@ -3,7 +3,9 @@ cmake_minimum_required(VERSION 3.1...3.29)
 project(
 	ExampleDecoder
 	VERSION 1.0
-	LANGUAGES CXX)
+	LANGUAGES C CXX)
+
+include(CTest)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -13,12 +15,30 @@ include_directories(motioncam_decoder lib/include thirdparty)
 add_library(motioncam_decoder lib/Decoder.cpp lib/RawData.cpp lib/RawData_Legacy.cpp)
 set_property(TARGET motioncam_decoder PROPERTY POSITION_INDEPENDENT_CODE ON)
 
-add_executable(example example.cpp)
+if (MSVC)
+    target_compile_options(motioncam_decoder PRIVATE /utf-8)
+endif()
+
+add_executable(example example.cpp thirdparty/liblj92/lj92.c)
 
 target_link_libraries(example PRIVATE motioncam_decoder)
 
+if (BUILD_TESTING)
+    add_executable(decoder_test tests/DecoderTest.cpp)
+    target_link_libraries(decoder_test PRIVATE motioncam_decoder)
+    add_test(NAME decoder_test COMMAND decoder_test)
+
+    add_executable(decoder_gyro_test tests/DecoderGyroTest.cpp)
+    target_link_libraries(decoder_gyro_test PRIVATE motioncam_decoder)
+    add_test(NAME decoder_gyro_test COMMAND decoder_gyro_test)
+
+    add_executable(decoder_accelerometer_test tests/DecoderAccelerometerTest.cpp)
+    target_link_libraries(decoder_accelerometer_test PRIVATE motioncam_decoder)
+    add_test(NAME decoder_accelerometer_test COMMAND decoder_accelerometer_test)
+endif()
+
 if (MSVC)
-    add_compile_options(/W4 /WX)
+    add_compile_options(/W4 /WX /utf-8)
 else()
     add_compile_options(-Wall -Werror -O3)
 endif()
