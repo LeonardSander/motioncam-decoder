@@ -1105,6 +1105,14 @@ static bool WriteTIFFTag(const unsigned short tag, const unsigned short type,
       return false;
     }
 
+    // TIFF 6.0 requires value data referenced by an offset to begin on a
+    // word boundary. Variable-length values (notably ASCII strings) can
+    // otherwise leave the next payload at an odd address.
+    if ((static_cast<std::streamoff>(data_out->tellp()) & 1) != 0) {
+      const char pad = 0;
+      data_out->write(&pad, 1);
+    }
+
     // Store offset value.
 
     unsigned int offset =
@@ -2495,6 +2503,12 @@ bool DNGImage::SetImageData(const unsigned char *data, const size_t data_len) {
     return false;
   }
 
+  // Strip data is offset-addressed too, so keep it word-aligned even when
+  // the last metadata payload had odd length.
+  if ((static_cast<std::streamoff>(data_os_.tellp()) & 1) != 0) {
+    const char pad = 0;
+    data_os_.write(&pad, 1);
+  }
   data_strip_offset_ = size_t(data_os_.tellp());
 
   const unsigned char* write_data = data;
