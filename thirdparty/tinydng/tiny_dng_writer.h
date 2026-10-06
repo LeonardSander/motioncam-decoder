@@ -476,7 +476,11 @@ class DNGImage {
   bool SetCustomFieldLong(const unsigned short tag, const int value);
   bool SetCustomFieldULong(const unsigned short tag, const unsigned int value);
 
-  size_t GetDataSize() const { return data_os_.str().length(); }
+  size_t GetDataSize() const {
+    const auto end = data_os_.rdbuf()->pubseekoff(
+        0, std::ios_base::cur, std::ios_base::out);
+    return end == std::streampos(-1) ? 0 : static_cast<size_t>(end);
+  }
 
   size_t GetStripOffset() const { return data_strip_offset_; }
   size_t GetStripBytes() const { return data_strip_bytes_; }
@@ -2688,7 +2692,8 @@ static bool IFDComparator(const IFDTag &a, const IFDTag &b) {
 }
 
 bool DNGImage::WriteDataToStream(std::ostream *ofs) const {
-  if ((data_os_.str().length() == 0)) {
+  const std::string data_string = data_os_.str();
+  if (data_string.empty()) {
     err_ += "Empty IFD data and image data.\n";
     return false;
   }
@@ -2710,8 +2715,13 @@ bool DNGImage::WriteDataToStream(std::ostream *ofs) const {
     return false;
   }
 
-  std::vector<uint8_t> data(data_os_.str().length());
-  memcpy(data.data(), data_os_.str().data(), data.size());
+  if (!swap_endian_ || compression_type_ != COMPRESSION_NONE ||
+      data_strip_bytes_ == 0) {
+    ofs->write(data_string.data(),
+               static_cast<std::streamsize>(data_string.size()));
+    return true;
+  }
+  std::vector<uint8_t> data(data_string.begin(), data_string.end());
 
   if (data_strip_bytes_ == 0) {
     // May ok?.
