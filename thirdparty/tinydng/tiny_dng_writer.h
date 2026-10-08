@@ -471,6 +471,11 @@ class DNGImage {
 
   /// Set image data.
   bool SetImageData(const unsigned char *data, const size_t data_len);
+  // Borrow an uncompressed little-endian strip until WriteToFile completes.
+  // Call after all metadata setters so the strip is the last data payload.
+  bool SetImageDataBorrowed(const unsigned char *data, const size_t data_len);
+  // Reserve a fixed metadata prefix for a strip already in the destination buffer.
+  bool PadImageDataOffset(size_t offset);
 
   /// Set custom field.
   bool SetCustomFieldLong(const unsigned short tag, const int value);
@@ -479,7 +484,7 @@ class DNGImage {
   size_t GetDataSize() const {
     const auto end = data_os_.rdbuf()->pubseekoff(
         0, std::ios_base::cur, std::ios_base::out);
-    return end == std::streampos(-1) ? 0 : static_cast<size_t>(end);
+    return end == std::streampos(-1) ? 0 : static_cast<size_t>(end) + borrowed_image_size_;
   }
 
   size_t GetStripOffset() const { return data_strip_offset_; }
@@ -518,6 +523,8 @@ class DNGImage {
   // TODO(syoyo): Support multiple strips
   size_t data_strip_offset_{0};
   size_t data_strip_bytes_{0};
+  const unsigned char *borrowed_image_data_{nullptr};
+  size_t borrowed_image_size_{0};
 
   mutable std::string err_;  // Error message
 
@@ -2502,6 +2509,34 @@ bool DNGImage::SetImageDataPacked(const unsigned short *input_buffer, const int 
   return SetImageData(reinterpret_cast<unsigned char*>(output.data()), output.size() * sizeof(unsigned short));
 }
 
+bool DNGImage::PadImageDataOffset(size_t offset) {
+  const auto current = data_os_.tellp();
+  if (current == std::streampos(-1) || static_cast<size_t>(current) > offset ||
+      data_strip_bytes_ || borrowed_image_data_) return false;
+  const std::string padding(offset - static_cast<size_t>(current), '\0');
+  data_os_.write(padding.data(), static_cast<std::streamsize>(padding.size()));
+  return data_os_.good();
+}
+
+bool DNGImage::SetImageDataBorrowed(const unsigned char *data, const size_t data_len) {
+  if (!data || !data_len || data_len > std::numeric_limits<unsigned int>::max() ||
+      dng_big_endian_ || compression_type_ != COMPRESSION_NONE ||
+      borrowed_image_data_ || data_strip_bytes_) return false;
+  if ((static_cast<std::streamoff>(data_os_.tellp()) & 1) != 0) {
+    const char pad = 0;
+    data_os_.write(&pad, 1);
+  }
+  data_strip_offset_ = static_cast<size_t>(data_os_.tellp());
+  data_strip_bytes_ = data_len;
+  borrowed_image_data_ = data;
+  borrowed_image_size_ = data_len;
+  const unsigned int bytes = static_cast<unsigned int>(data_len);
+  return WriteTIFFTag(static_cast<unsigned short>(TIFFTAG_STRIP_BYTE_COUNTS),
+                      TIFF_LONG, 1,
+                      reinterpret_cast<const unsigned char *>(&bytes),
+                      &ifd_tags_, NULL);
+}
+
 bool DNGImage::SetImageData(const unsigned char *data, const size_t data_len) {
   if ((data == NULL) || (data_len < 1)) {
     return false;
@@ -2713,6 +2748,13 @@ bool DNGImage::WriteDataToStream(std::ostream *ofs) const {
   if (samples_per_pixels_ == 0) {
     err_ += "SamplesPerPixels is not set or zero.";
     return false;
+  }
+
+  if (borrowed_image_data_) {
+    ofs->write(data_string.data(), static_cast<std::streamsize>(data_string.size()));
+    ofs->write(reinterpret_cast<const char *>(borrowed_image_data_),
+               static_cast<std::streamsize>(borrowed_image_size_));
+    return ofs->good();
   }
 
   if (!swap_endian_ || compression_type_ != COMPRESSION_NONE ||
