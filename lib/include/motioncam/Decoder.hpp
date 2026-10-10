@@ -113,6 +113,15 @@ namespace motioncam {
         void loadAccelerometerData(std::vector<MotionSample>& outSamples);
         
     private:
+        struct UnspektraEntry {
+            uint64_t recipeOffset = 0;
+            uint64_t rawOffset = 0;
+        };
+        void initUnspektra();
+        nlohmann::json unspektraFrameMetadata(Timestamp timestamp) const;
+        std::vector<uint8_t> unspektraRecord(uint64_t offset, size_t maxSize) const;
+        void loadUnspektraFrame(Timestamp timestamp, std::vector<uint8_t>& outData,
+                                nlohmann::json& outMetadata);
         void init();
         void read(void* data, size_t size, size_t items=1) const;
         void readIndex();
@@ -135,6 +144,8 @@ namespace motioncam {
         nlohmann::json mMetadata;
         std::vector<uint8_t> mTmpBuffer;
         std::unique_ptr<AudioChunkLoader> mAudioLoader;
+        bool mUnspektra = false;
+        std::map<Timestamp, UnspektraEntry> mUnspektraEntries;
     };
 } // namespace motioncam
 

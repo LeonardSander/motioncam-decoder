@@ -137,6 +137,16 @@ namespace motioncam {
     }
 
     void Decoder::init() {
+        uint8_t signature[8]{};
+        read(signature, sizeof(signature));
+        if(std::memcmp(signature, "UNSPKTRA", sizeof(signature)) == 0) {
+            mUnspektra = true;
+            initUnspektra();
+            mAudioLoader = std::make_unique<AudioChunkLoaderImpl>(mFile, mAudioOffsets);
+            return;
+        }
+        if(FSEEK(mFile, 0, SEEK_SET) != 0)
+            throw IOException("Failed to rewind container");
         Header header{};
         
         // Check validity of file
@@ -275,6 +285,12 @@ namespace motioncam {
     
     void Decoder::loadFrame(const Timestamp timestamp, std::vector<uint8_t>& outData,
                             nlohmann::json& outMetadata, int widthOverride) {
+        if (mUnspektra) {
+            // UFR1 declares its own raster width; a MotionCam stride repair
+            // suffix does not apply to this container.
+            loadUnspektraFrame(timestamp, outData, outMetadata);
+            return;
+        }
         if(mFrameOffsetMap.find(timestamp) == mFrameOffsetMap.end())
             throw IOException("Frame not found (timestamp: " + std::to_string(timestamp) + ")");
 
@@ -337,6 +353,10 @@ namespace motioncam {
     }
 
     void Decoder::loadFrameMetadata(const Timestamp timestamp, nlohmann::json& outMetadata) {
+        if (mUnspektra) {
+            outMetadata = unspektraFrameMetadata(timestamp);
+            return;
+        }
         if(mFrameOffsetMap.find(timestamp) == mFrameOffsetMap.end())
             throw IOException("Frame not found (timestamp: " + std::to_string(timestamp) + ")");
         

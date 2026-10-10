@@ -12,7 +12,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include_directories(motioncam_decoder lib/include thirdparty)
 
-add_library(motioncam_decoder lib/Decoder.cpp lib/RawData.cpp lib/RawData_Legacy.cpp)
+find_package(ZLIB REQUIRED)
+add_library(motioncam_decoder lib/Decoder.cpp lib/RawData.cpp lib/RawData_Legacy.cpp lib/Unspektra.cpp)
+target_link_libraries(motioncam_decoder PUBLIC ZLIB::ZLIB)
 set_property(TARGET motioncam_decoder PROPERTY POSITION_INDEPENDENT_CODE ON)
 
 if (MSVC)
