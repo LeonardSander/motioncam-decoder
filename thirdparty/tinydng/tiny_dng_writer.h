@@ -1037,7 +1037,10 @@ static bool CompressJPEGXL(const unsigned char* input, size_t input_size,
     return fail("Could not add JPEG XL image frame");
   JxlEncoderCloseInput(encoder);
 
-  output.resize(std::max<size_t>(4096, input_size / 2));
+  // Lossy raw frames are usually much smaller than half the input; the
+  // output loop below still grows the buffer for less compressible frames.
+  output.resize(std::max<size_t>(4096,
+      distance > 0.0f ? input_size / 16 : input_size / 2));
   uint8_t* next = output.data();
   size_t available = output.size();
   for (;;) {
