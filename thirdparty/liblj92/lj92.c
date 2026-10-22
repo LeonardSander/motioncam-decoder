@@ -25,6 +25,7 @@ sourced from MLV repository https://github.com/ilia3101/MLV-App/tree/master/src/
 */
 
 #include <stdint.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -828,6 +829,7 @@ int frequencyScan(lje* self) {
     int scan = self->readLength;
     const int rowSamples = self->width * self->components;
     uint16_t* rowcache = (uint16_t*)calloc(2 * rowSamples, sizeof(uint16_t));
+    if (!rowcache) return LJ92_ERROR_NO_MEMORY;
     uint16_t* rows[2];
     rows[0] = rowcache;
     rows[1] = &rowcache[rowSamples];
@@ -836,41 +838,44 @@ int frequencyScan(lje* self) {
     int row = 0;
     uint64_t costs[8] = {0};
     int candidateHist[8][18] = {{0}};
+    const int sampledHistogram = pixcount >= 1000000;
     
-    // Debug output removed
-    //int maxval = (1 << self->bitdepth);
     while (pixcount--) {
         uint16_t p = *pixel;
-        /* if (self->delinearize) {
+        if (self->delinearize) {
             if (p>=self->delinearizeLength) {
                 free(rowcache);
                 return LJ92_ERROR_TOO_WIDE;
             }
             p = self->delinearize[p];
         }
-        if (p>=maxval) {
+        if (self->bitdepth < 16 && p >= (1u << self->bitdepth)) {
             free(rowcache);
             return LJ92_ERROR_TOO_WIDE;
-        } */
+        }
         const int component = col % self->components;
         const int pixelColumn = col / self->components;
         rows[1][col] = p;
 
-        for (int predictor = 1; predictor <= 7; ++predictor) {
-            int Px;
-            if (row == 0 && pixelColumn == 0)
-                Px = 1 << (self->bitdepth-1);
-            else if (row == 0)
-                Px = rows[1][col-self->components];
-            else if (pixelColumn == 0)
-                Px = rows[0][component];
-            else
-                Px = prediction(predictor, rows[1][col-self->components],
-                                rows[0][col], rows[0][col-self->components]);
-            int32_t diff = (int16_t)((rows[1][col] - Px) % 65536);
-            int ssss = diff == 0 ? 0 : 32 - __builtin_clz(abs(diff));
-            candidateHist[predictor][ssss]++;
-            costs[predictor] += ssss;
+        // Sample 2x2 blocks so every Bayer phase contributes to the table.
+        if (!sampledHistogram ||
+            (((row >> 1) * 3 + (pixelColumn >> 1)) & 7) == 0) {
+            for (int predictor = 1; predictor <= 7; ++predictor) {
+                int Px;
+                if (row == 0 && pixelColumn == 0)
+                    Px = 1 << (self->bitdepth-1);
+                else if (row == 0)
+                    Px = rows[1][col-self->components];
+                else if (pixelColumn == 0)
+                    Px = rows[0][component];
+                else
+                    Px = prediction(predictor, rows[1][col-self->components],
+                                    rows[0][col], rows[0][col-self->components]);
+                int32_t diff = (int16_t)((rows[1][col] - Px) % 65536);
+                int ssss = diff == 0 ? 0 : 32 - __builtin_clz(abs(diff));
+                costs[predictor] += ssss;
+                candidateHist[predictor][ssss]++;
+            }
         }
         pixel++;
         scan--;
@@ -888,7 +893,12 @@ int frequencyScan(lje* self) {
     for (int predictor = 2; predictor <= 7; ++predictor)
         if (costs[predictor] < costs[self->predictor]) self->predictor = predictor;
     memcpy(self->hist, candidateHist[self->predictor], sizeof(self->hist));
-    
+    // A rare category can be absent from the sample but present elsewhere.
+    // Include every category so the full encode pass always has a code.
+    if (sampledHistogram)
+        for (int category = 0; category <= 16; ++category)
+            if (!self->hist[category]) self->hist[category] = 1;
+
     free(rowcache);
     return LJ92_ERROR_NONE;
 }
@@ -899,7 +909,8 @@ void createEncodeTable(lje* self) {
     int others[18];
 
     // Calculate frequencies
-    float totalpixels = self->width * self->height * self->components;
+    float totalpixels = 0;
+    for (int i = 0; i < 17; ++i) totalpixels += self->hist[i];
     for (int i=0;i<17;i++) {
         freq[i] = (float)(self->hist[i])/totalpixels;
 #ifdef DEBUG
@@ -1127,8 +1138,26 @@ void writePost(lje* self) {
     self->encodedWritten = w;
 }
 
+static inline int emitBits(lje* self, int* written, uint32_t* pending,
+                           int* pendingBits, uint32_t value, int count) {
+    if (!count) return LJ92_ERROR_NONE;
+    *pending = (*pending << count) | (value & ((1u << count) - 1u));
+    *pendingBits += count;
+    while (*pendingBits >= 8) {
+        const uint8_t byte = (uint8_t)(*pending >> (*pendingBits - 8));
+        // Keep two bytes available for the EOI marker.
+        if (*written > self->encodedLength - (byte == 0xff ? 4 : 3))
+            return LJ92_ERROR_ENCODER;
+        self->encoded[(*written)++] = byte;
+        if (byte == 0xff) self->encoded[(*written)++] = 0;
+        *pendingBits -= 8;
+        *pending &= (1u << *pendingBits) - 1u;
+    }
+    return LJ92_ERROR_NONE;
+}
+
 int writeBody(lje* self) {
-    // Scan through the tile using the standard type 6 prediction
+    // Scan through the tile using the selected lossless predictor.
     // Need to cache the previous 2 row in target coordinates because of tiling
     uint16_t* pixel = self->image;
     int pixcount = self->width*self->height*self->components;
@@ -1144,10 +1173,9 @@ int writeBody(lje* self) {
     int Px = 0;
     int32_t diff = 0;
     //int bitcount = 0;
-    uint8_t* out = self->encoded;
     int w = self->encodedWritten;
-    uint8_t next = 0;
-    uint8_t nextbits = 8;
+    uint32_t pending = 0;
+    int pendingBits = 0;
     while (pixcount--) {
         uint16_t p = *pixel;
         if (self->delinearize) p = self->delinearize[p];
@@ -1167,14 +1195,13 @@ int writeBody(lje* self) {
         diff = rows[1][col] - Px;
         diff = diff%65536;
         diff = (int16_t)diff;
-        int ssss = 32 - __builtin_clz(abs(diff));
-        if (diff==0) ssss=0;
+        int ssss = diff == 0 ? 0 : 32 - __builtin_clz(abs(diff));
         //printf("%d %d %d %d %d\n",col,row,Px,diff,ssss);
 
         // Write the huffman code for the ssss value
         int huffcode = self->huffsym[ssss];
-        int huffenc = self->huffenc[huffcode];
-        int huffbits = self->huffbits[huffcode];
+        const int huffenc = self->huffenc[huffcode];
+        const int huffbits = self->huffbits[huffcode];
 
         int vt = ssss>0?(1<<(ssss-1)):0;
         //printf("%d %d %d %d\n",rows[1][col],Px,diff,Px+diff);
@@ -1183,51 +1210,20 @@ int writeBody(lje* self) {
         if (diff < vt)
             diff += (1 << (ssss))-1;
 
-        // Write the ssss
-        while (huffbits>0) {
-            int usebits = huffbits>nextbits?nextbits:huffbits;
-            // Add top usebits from huffval to next usebits of nextbits
-            int tophuff = huffenc >> (huffbits - usebits);
-            next |= (tophuff << (nextbits-usebits));
-            nextbits -= usebits;
-            huffbits -= usebits;
-            huffenc &= (1<<huffbits)-1;
-            if (nextbits==0) {
-                if(w >= self->encodedLength - 1)
-                {
-                    free(rowcache);
-                    return LJ92_ERROR_ENCODER;
-                }
-                out[w++] = next;
-                if (next==0xff) out[w++] = 0x0;
-                next = 0;
-                nextbits = 8;
-            }
+        if (emitBits(self, &w, &pending, &pendingBits, huffenc,
+                     huffbits) != LJ92_ERROR_NONE) {
+            free(rowcache);
+            return LJ92_ERROR_ENCODER;
         }
         // Write the rest of the bits for the value
         if (ssss == 16) {
-            // Diff values (always 32678) for SSSS=16 are encoded with 0 bits
+            // A difference of -32768 (category 16) has no magnitude bits.
             ssss = 0;
         }
-        while (ssss>0) {
-            int usebits = ssss>nextbits?nextbits:ssss;
-            // Add top usebits from huffval to next usebits of nextbits
-            int tophuff = diff >> (ssss - usebits);
-            next |= (tophuff << (nextbits-usebits));
-            nextbits -= usebits;
-            ssss -= usebits;
-            diff &= (1<<ssss)-1;
-            if (nextbits==0) {
-                if(w >= self->encodedLength - 1)
-                {
-                    free(rowcache);
-                    return LJ92_ERROR_ENCODER;
-                }
-                out[w++] = next;
-                if (next==0xff) out[w++] = 0x0;
-                next = 0;
-                nextbits = 8;
-            }
+        if (emitBits(self, &w, &pending, &pendingBits,
+                     (uint32_t)diff, ssss) != LJ92_ERROR_NONE) {
+            free(rowcache);
+            return LJ92_ERROR_ENCODER;
         }
 
         //printf("%d %d\n",diff,ssss);
@@ -1244,9 +1240,14 @@ int writeBody(lje* self) {
         }
     }
     // Flush the final bits
-    if (nextbits<8) {
-        out[w++] = next;
-        if (next==0xff) out[w++] = 0x0;
+    if (pendingBits) {
+        const uint8_t byte = (uint8_t)(pending << (8 - pendingBits));
+        if (w > self->encodedLength - (byte == 0xff ? 4 : 3)) {
+            free(rowcache);
+            return LJ92_ERROR_ENCODER;
+        }
+        self->encoded[w++] = byte;
+        if (byte == 0xff) self->encoded[w++] = 0;
     }
 #ifdef DEBUG
     int sort[18];
@@ -1272,7 +1273,11 @@ int lj92_encode(uint16_t* image, int width, int height, int bitdepth, int compon
 
     lje* self = (lje*)calloc(sizeof(lje),1);
     if (self==NULL) return LJ92_ERROR_NO_MEMORY;
-    if (components < 1 || components > 4) {
+    if (!image || !encoded || !encodedLength || width <= 0 || height <= 0 ||
+        bitdepth < 2 || bitdepth > 16 || components < 1 || components > 4 ||
+        width > INT_MAX / components / height ||
+        readLength < width * components || skipLength < 0 ||
+        width * height * components > (INT_MAX - 256) / 3) {
         free(self);
         return LJ92_ERROR_ENCODER;
     }
@@ -1311,7 +1316,8 @@ int lj92_encode(uint16_t* image, int width, int height, int bitdepth, int compon
 #ifdef DEBUG
     printf("written:%d\n",self->encodedWritten);
 #endif
-    self->encoded = realloc(self->encoded,self->encodedWritten);
+    uint8_t* trimmed = realloc(self->encoded,self->encodedWritten);
+    if (trimmed) self->encoded = trimmed;
     self->encodedLength = self->encodedWritten;
     *encoded = self->encoded;
     *encodedLength = self->encodedLength;

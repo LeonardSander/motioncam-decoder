@@ -34,8 +34,13 @@ THE SOFTWARE.
 #ifdef TINY_DNG_ENABLE_JPEG_XL
 #include <jxl/encode.h>
 #include <jxl/color_encoding.h>
+#include "JxlParallelRunner.h"
+#include "DngCfaInterleave.h"
 #endif
 #include <vector>
+#include <cstdlib>
+#include <limits>
+#include <memory>
 
 // Enable JPEG compression by default (using lj92 for true lossless)
 #ifndef TINY_DNG_ENABLE_JPEG
@@ -342,6 +347,7 @@ class DNGImage {
   bool SetOrientation(unsigned short value);
   bool SetCompression(unsigned short value);
   bool SetJXLDistance(float distance);
+  bool SetJXLInterleaveCFA(unsigned row_factor, unsigned column_factor);
   bool SetPredictor(unsigned short value);    //untested
   bool SetSampleFormat(const unsigned int num_samples,
                        const unsigned short *values);
@@ -484,10 +490,20 @@ class DNGImage {
   size_t GetDataSize() const {
     const auto end = data_os_.rdbuf()->pubseekoff(
         0, std::ios_base::cur, std::ios_base::out);
-    return end == std::streampos(-1) ? 0 : static_cast<size_t>(end) + borrowed_image_size_;
+    if (end == std::streampos(-1)) return 0;
+    const size_t metadata_size = static_cast<size_t>(end);
+    return metadata_size + borrowed_image_size_ + compressed_image_size_ +
+        (compressed_image_size_ ? (metadata_size & 1u) : 0u);
   }
 
-  size_t GetStripOffset() const { return data_strip_offset_; }
+  size_t GetStripOffset() const {
+    if (!compressed_image_size_) return data_strip_offset_;
+    // Metadata setters can run after SetImageData; append the owned strip last.
+    const auto end = data_os_.rdbuf()->pubseekoff(
+        0, std::ios_base::cur, std::ios_base::out);
+    return end == std::streampos(-1) ? 0 :
+        static_cast<size_t>(end) + (static_cast<size_t>(end) & 1u);
+  }
   size_t GetStripBytes() const { return data_strip_bytes_; }
 
   /// Write aux IFD data and strip image data to stream.
@@ -515,6 +531,8 @@ class DNGImage {
   std::vector<unsigned short> bits_per_samples_;
   unsigned short compression_type_{COMPRESSION_NONE};
   float jxl_distance_{0.0f};
+  unsigned jxl_row_interleave_{1};
+  unsigned jxl_column_interleave_{1};
 
   // Image dimensions (needed for JPEG compression)
   unsigned int image_width_{0};
@@ -525,6 +543,9 @@ class DNGImage {
   size_t data_strip_bytes_{0};
   const unsigned char *borrowed_image_data_{nullptr};
   size_t borrowed_image_size_{0};
+  std::unique_ptr<unsigned char, decltype(&std::free)> jpeg_image_data_{nullptr, &std::free};
+  std::vector<unsigned char> jxl_image_data_;
+  size_t compressed_image_size_{0};
 
   mutable std::string err_;  // Error message
 
@@ -585,7 +606,6 @@ class DNGWriter {
 #include <cstring>
 #include <fstream>
 #include <iostream>
-#include <limits>
 #include <sstream>
 
 namespace tinydngwriter {
@@ -833,7 +853,7 @@ static void swap8(uint64_t *val) {
 // Helper function to compress data using JPEG lossless (lj92)
 static bool CompressJPEGLossless(const unsigned char* input, size_t input_size,
                                  int width, int height, int components, int bits_per_sample,
-                                 std::vector<unsigned char>& output, std::string* err) {
+                                 unsigned char** output, int* output_size, std::string* err) {
 #ifdef TINY_DNG_ENABLE_JPEG
   if (input == nullptr || input_size == 0) {
     if (err) {
@@ -856,68 +876,37 @@ static bool CompressJPEGLossless(const unsigned char* input, size_t input_size,
     return false;
   }
 
-  // Convert input to uint16_t array
-  int pixel_count = width * height * components;
-  if (pixel_count <= 0 ||
-      input_size != static_cast<size_t>(pixel_count) * sizeof(uint16_t)) {
+  if (width <= 0 || height <= 0 ||
+      static_cast<size_t>(width) >
+          static_cast<size_t>(std::numeric_limits<int>::max()) / components / height ||
+      input_size != static_cast<size_t>(width) * height * components * sizeof(uint16_t)) {
     if (err) {
       *err = "Lossless JPEG expects one unpacked 16-bit sample per pixel";
     }
     return false;
   }
-  uint16_t* image_data = new uint16_t[pixel_count];
-
-  uint16_t max_value = 0;
-  uint16_t min_value = 65535;
-
-  // Check if data is actually 16-bit by examining input_size
-  // For true 8-bit: input_size = pixel_count
-  // For 16-bit: input_size = pixel_count * 2
-  //bool is_16bit_storage = (input_size >= pixel_count * 2);
-
-  //if (bits_per_sample <= 8 && !is_16bit_storage) {
-    // True 8-bit packed data (1 byte per pixel)
-  //  for (int i = 0; i < pixel_count; i++) {
-  //    image_data[i] = input[i];
-  //    if (image_data[i] > max_value) max_value = image_data[i];
-  //    if (image_data[i] < min_value) min_value = image_data[i];
-  //  }
-  //} else {
-    // 16-bit unpacked data
-    const uint16_t* input16 = reinterpret_cast<const uint16_t*>(input);
-
-    for (int i = 0; i < pixel_count; i++) {
-      image_data[i] = input16[i];
-      if (image_data[i] > max_value) max_value = image_data[i];
-      if (image_data[i] < min_value) min_value = image_data[i];
-    }
-  //}
-
-  // Validate bit depth matches actual data range
-  uint16_t expected_max = bits_per_sample == 16
-      ? std::numeric_limits<uint16_t>::max()
-      : static_cast<uint16_t>((1u << bits_per_sample) - 1u);
-
-  if (max_value > expected_max) {
-    if (err) {
-      *err = "Pixel values exceed the declared lossless JPEG bit depth";
-    }
-    delete[] image_data;
-    return false;
+  const size_t pixel_count = static_cast<size_t>(width) * height * components;
+  // Normal DNG output is aligned, so encode directly from its pixel buffer.
+  // Copy only when the caller supplies an unaligned byte buffer.
+  std::vector<uint16_t> aligned_samples;
+  const uint16_t* image_data = nullptr;
+  if ((reinterpret_cast<uintptr_t>(input) & (alignof(uint16_t) - 1)) == 0) {
+    image_data = reinterpret_cast<const uint16_t*>(input);
+  } else {
+    aligned_samples.resize(pixel_count);
+    std::memcpy(aligned_samples.data(), input, input_size);
+    image_data = aligned_samples.data();
   }
 
-  // Use specified bit depth
-  int optimal_bits = bits_per_sample;
-
-  // Encode using lj92 with optimal parameters for maximum compression
+  // lj92 validates the declared range during its predictor scan.
   uint8_t* encoded = nullptr;
   int encoded_length = 0;
 
   int ret = lj92_encode(
-    image_data,
+    const_cast<uint16_t*>(image_data), // lj92 reads its input but declares it mutable.
     width,
     height,
-    optimal_bits,  // Use optimal bit depth for maximum compression
+    bits_per_sample,
     components,
     width * components, // readLength (full interleaved row, in samples)
     0,             // skipLength (no skip)
@@ -927,31 +916,30 @@ static bool CompressJPEGLossless(const unsigned char* input, size_t input_size,
     &encoded_length
   );
 
-  delete[] image_data;
-
   if (ret != LJ92_ERROR_NONE) {
+    free(encoded);
     if (err) {
-      *err = "lj92_encode failed with error code " + std::to_string(ret);
+      *err = ret == LJ92_ERROR_TOO_WIDE
+          ? "Pixel values exceed the declared lossless JPEG bit depth"
+          : "lj92_encode failed with error code " + std::to_string(ret);
     }
     return false;
   }
 
   if (encoded_length == 0 || encoded == nullptr) {
+    free(encoded);
     if (err) {
       *err = "lj92_encode returned empty data";
     }
     return false;
   }
 
-  // Copy to output vector
-  output.resize(encoded_length);
-  memcpy(output.data(), encoded, encoded_length);
-
-  // Free the encoded buffer (lj92_encode allocates it)
-  free(encoded);
+  *output = encoded;
+  *output_size = encoded_length;
 
   return true;
 #else
+  (void)output; (void)output_size;
   if (err) {
     *err = "JPEG compression not enabled. Define TINY_DNG_ENABLE_JPEG and link with lj92.";
   }
@@ -964,13 +952,34 @@ static bool CompressJPEGLossless(const unsigned char* input, size_t input_size,
 // smaller; black/white-level tags retain that range without rescaling samples.
 static bool CompressJPEGXL(const unsigned char* input, size_t input_size,
                            int width, int height, int components, float distance,
-                           std::vector<unsigned char>& output, std::string* err) {
+                           std::vector<unsigned char>& output, std::string* err,
+                           unsigned row_interleave = 1, unsigned column_interleave = 1) {
 #ifdef TINY_DNG_ENABLE_JPEG_XL
-  const size_t sample_count = static_cast<size_t>(width) * height * components;
   if (!input || width <= 0 || height <= 0 || (components != 1 && components != 3) ||
-      input_size != sample_count * sizeof(uint16_t) || distance < 0.0f) {
+      static_cast<size_t>(width) >
+          std::numeric_limits<size_t>::max() / height / components / sizeof(uint16_t) ||
+      input_size != static_cast<size_t>(width) * height * components * sizeof(uint16_t) ||
+      distance < 0.0f) {
     if (err) *err = "Invalid JPEG XL input";
     return false;
+  }
+  const size_t sample_count = static_cast<size_t>(width) * height * components;
+  std::vector<uint16_t> aligned_samples, interleaved;
+  if (row_interleave != 1 || column_interleave != 1) {
+    const uint16_t* samples = nullptr;
+    if ((reinterpret_cast<uintptr_t>(input) & (alignof(uint16_t) - 1)) == 0) {
+      samples = reinterpret_cast<const uint16_t*>(input);
+    } else {
+      aligned_samples.resize(sample_count);
+      std::memcpy(aligned_samples.data(), input, input_size);
+      samples = aligned_samples.data();
+    }
+    if (!motioncam::reorderDngSamples(samples, sample_count, interleaved, width, height,
+            components, row_interleave, column_interleave, true)) {
+      if (err) *err = "Invalid JPEG XL CFA interleave";
+      return false;
+    }
+    input = reinterpret_cast<const unsigned char*>(interleaved.data());
   }
 
   JxlEncoder* encoder = JxlEncoderCreate(nullptr);
@@ -983,6 +992,8 @@ static bool CompressJPEGXL(const unsigned char* input, size_t input_size,
     JxlEncoderDestroy(encoder);
     return false;
   };
+  motioncam::JxlParallelRunner runner(sample_count);
+  if (!runner.attach(encoder)) return fail("Could not set JPEG XL parallel runner");
 
   // TIFF/DNG stores a bare codestream in each strip/tile, not a .jxl container.
   JxlBasicInfo info;
@@ -992,7 +1003,9 @@ static bool CompressJPEGXL(const unsigned char* input, size_t input_size,
   info.bits_per_sample = 16;
   info.exponent_bits_per_sample = 0;
   info.num_color_channels = static_cast<uint32_t>(components);
-  info.uses_original_profile = JXL_TRUE;
+  // Lossy VarDCT with the original profile can introduce colored blocks.
+  // Use libjxl's XYB path for lossy data; lossless needs the original profile.
+  info.uses_original_profile = distance == 0.0f ? JXL_TRUE : JXL_FALSE;
   if (JxlEncoderSetBasicInfo(encoder, &info) != JXL_ENC_SUCCESS)
     return fail("Could not set JPEG XL basic info");
 
@@ -1444,6 +1457,17 @@ bool DNGImage::SetJXLDistance(float distance) {
     return false;
   }
   jxl_distance_ = distance;
+  return true;
+}
+
+bool DNGImage::SetJXLInterleaveCFA(unsigned row_factor, unsigned column_factor) {
+  if (compression_type_ != COMPRESSION_JPEG_XL || jxl_distance_ <= 0.0f ||
+      samples_per_pixels_ != 1 || row_factor < 2 || column_factor < 2 ||
+      row_factor > image_height_ || column_factor > image_width_) return false;
+  if (!SetCustomFieldULong(50975, row_factor) ||
+      !SetCustomFieldULong(52547, column_factor)) return false;
+  jxl_row_interleave_ = row_factor;
+  jxl_column_interleave_ = column_factor;
   return true;
 }
 
@@ -2580,14 +2604,17 @@ bool DNGImage::SetImageData(const unsigned char *data, const size_t data_len) {
             ", bits=" + std::to_string(bits) + ", components=" + std::to_string(components) + "\n";
 
     // Use lossless JPEG compression
+    unsigned char* encoded = nullptr;
+    int encoded_length = 0;
     if (!CompressJPEGLossless(data, data_len, image_width_, image_height_,
-                              components, bits, compressed_data, &err_)) {
+                              components, bits, &encoded, &encoded_length, &err_)) {
       err_ += "JPEG compression failed in SetImageData\n";
       return false;
     }
 
-    write_data = compressed_data.data();
-    write_len = compressed_data.size();
+    jpeg_image_data_.reset(encoded);
+    write_data = jpeg_image_data_.get();
+    write_len = static_cast<size_t>(encoded_length);
 
     if (write_len == 0) {
       err_ += "JPEG compressed data is empty\n";
@@ -2603,12 +2630,14 @@ bool DNGImage::SetImageData(const unsigned char *data, const size_t data_len) {
       return false;
     }
     if (!CompressJPEGXL(data, data_len, image_width_, image_height_,
-                        samples_per_pixels_, jxl_distance_, compressed_data, &err_)) {
+                        samples_per_pixels_, jxl_distance_, compressed_data, &err_,
+                        jxl_row_interleave_, jxl_column_interleave_)) {
       err_ += "JPEG XL compression failed in SetImageData\n";
       return false;
     }
-    write_data = compressed_data.data();
     write_len = compressed_data.size();
+    jxl_image_data_ = std::move(compressed_data);
+    write_data = jxl_image_data_.data();
   }
   /*else if (compression_type_ == COMPRESSION_DEFLATE) {
     // Verify input data is not all zeros
@@ -2660,9 +2689,11 @@ bool DNGImage::SetImageData(const unsigned char *data, const size_t data_len) {
   }*/
 
   data_strip_bytes_ = write_len;
-
-  data_os_.write(reinterpret_cast<const char *>(write_data),
-                 static_cast<std::streamsize>(write_len));
+  if (compression_type_ == COMPRESSION_JPEG || compression_type_ == COMPRESSION_JPEG_XL)
+    compressed_image_size_ = write_len;
+  else
+    data_os_.write(reinterpret_cast<const char *>(write_data),
+                   static_cast<std::streamsize>(write_len));
 
   // NOTE: STRIP_OFFSET tag will be written at `WriteIFDToStream()`.
 
@@ -2728,7 +2759,7 @@ static bool IFDComparator(const IFDTag &a, const IFDTag &b) {
 
 bool DNGImage::WriteDataToStream(std::ostream *ofs) const {
   const std::string data_string = data_os_.str();
-  if (data_string.empty()) {
+  if (data_string.empty() && !compressed_image_size_ && !borrowed_image_size_) {
     err_ += "Empty IFD data and image data.\n";
     return false;
   }
@@ -2754,6 +2785,15 @@ bool DNGImage::WriteDataToStream(std::ostream *ofs) const {
     ofs->write(data_string.data(), static_cast<std::streamsize>(data_string.size()));
     ofs->write(reinterpret_cast<const char *>(borrowed_image_data_),
                static_cast<std::streamsize>(borrowed_image_size_));
+    return ofs->good();
+  }
+  if (compressed_image_size_) {
+    ofs->write(data_string.data(), static_cast<std::streamsize>(data_string.size()));
+    if (data_string.size() & 1u) ofs->put(0);
+    const unsigned char* compressed = jpeg_image_data_
+        ? jpeg_image_data_.get() : jxl_image_data_.data();
+    ofs->write(reinterpret_cast<const char*>(compressed),
+               static_cast<std::streamsize>(compressed_image_size_));
     return ofs->good();
   }
 
