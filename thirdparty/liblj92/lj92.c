@@ -258,6 +258,10 @@ static int parseHuff(ljp* self) {
         int value = 0;
         for (int bitLength = 1; bitLength <= maxbits; ++bitLength) {
             for (int code = 0; code < bits[bitLength - 1]; ++code, ++value) {
+                if (huffvals[value] > 16) {
+                    free(hufflut);
+                    return LJ92_ERROR_CORRUPT;
+                }
                 const int repetitions = 1 << (maxbits - bitLength);
                 if (output > (1 << maxbits) - repetitions) {
                     free(hufflut);
@@ -355,6 +359,7 @@ static int receive(ljp* self,int ssss) {
 }
 
 static int extend(ljp* self,int v,int t) {
+    if (t == 0) return 0;
     int vt = 1<<(t-1);
     if (v < vt) {
         vt = (-1 << t) + 1;
@@ -403,7 +408,7 @@ inline static int nextdiff(ljp* self, int component) {
     int t = ssssused>>8;
     //self->sssshist[t]++;
     cnt -= usedbits;
-    int keepbitsmask = (1 << cnt)-1;
+    u32 keepbitsmask = (1u << cnt)-1u;
     b &= keepbitsmask;
     int diff;
     if (t == 16) {
@@ -423,13 +428,13 @@ inline static int nextdiff(ljp* self, int component) {
         }
         cnt -= t;
         diff = b >> cnt;
-        int vt = 1<<(t-1);
-        if (diff < vt) {
-            vt = (-1 << t) + 1;
+        int vt = t ? 1<<(t-1) : 0;
+        if (t && diff < vt) {
+            vt = 1 - (1 << t);
             diff += vt;
         }
     }
-    keepbitsmask = (1 << cnt)-1;
+    keepbitsmask = (1u << cnt)-1u;
     self->b = b & keepbitsmask;
     self->cnt = cnt;
     self->ix = ix;
@@ -797,6 +802,9 @@ typedef struct _lje {
     int encodedWritten;
     int encodedLength;
     int predictor;
+    const int16_t* residuals;
+    lj92_entropy_writer entropyWriter;
+    void* entropyContext;
     int hist[18]; // SSSS frequency histogram
     int bits[18];
     int huffval[18];
@@ -1156,7 +1164,66 @@ static inline int emitBits(lje* self, int* written, uint32_t* pending,
     return LJ92_ERROR_NONE;
 }
 
+int writeBody(lje* self);
+static int writeBodyResiduals(lje* self) {
+    if (self->entropyWriter) {
+        uint16_t codes[18], codeBits[18];
+        for (int category = 0; category < 18; ++category) {
+            const int index = self->huffsym[category];
+            codes[category] = self->huffenc[index];
+            codeBits[category] = self->huffbits[index];
+        }
+        int written = 0;
+        const int capacity = self->encodedLength - self->encodedWritten - 2;
+        if (capacity > 0 &&
+            self->entropyWriter(self->residuals,
+                                self->width * self->height * self->components,
+                                codes, codeBits,
+                                self->encoded + self->encodedWritten, capacity,
+                                &written, self->entropyContext) == 0 &&
+            written >= 0 && written <= capacity) {
+            self->encodedWritten += written;
+            return LJ92_ERROR_NONE;
+        }
+    }
+    if (!self->residuals) {
+        self->entropyWriter = NULL;
+        return writeBody(self);
+    }
+    int written = self->encodedWritten;
+    uint32_t pending = 0;
+    int pendingBits = 0;
+    const int samples = self->width * self->height * self->components;
+    for (int i = 0; i < samples; ++i) {
+        int diff = self->residuals[i];
+        int category = diff == 0 ? 0 : 32 - __builtin_clz(abs(diff));
+        int codeIndex = self->huffsym[category];
+        const int code = self->huffenc[codeIndex];
+        const int codeBits = self->huffbits[codeIndex];
+        const int threshold = category ? 1 << (category - 1) : 0;
+        if (diff < threshold) diff += (1 << category) - 1;
+        if (emitBits(self, &written, &pending, &pendingBits, code,
+                     codeBits) != LJ92_ERROR_NONE) return LJ92_ERROR_ENCODER;
+        // Category 16 encodes only its Huffman symbol.
+        if (category == 16) category = 0;
+        if (emitBits(self, &written, &pending, &pendingBits,
+                     (uint32_t)diff, category) != LJ92_ERROR_NONE)
+            return LJ92_ERROR_ENCODER;
+    }
+    if (pendingBits) {
+        const uint8_t byte = (uint8_t)(pending << (8 - pendingBits));
+        if (written > self->encodedLength - (byte == 0xff ? 4 : 3))
+            return LJ92_ERROR_ENCODER;
+        self->encoded[written++] = byte;
+        if (byte == 0xff) self->encoded[written++] = 0;
+    }
+    self->encodedWritten = written;
+    return LJ92_ERROR_NONE;
+}
+
 int writeBody(lje* self) {
+    if (self->residuals || self->entropyWriter)
+        return writeBodyResiduals(self);
     // Scan through the tile using the selected lossless predictor.
     // Need to cache the previous 2 row in target coordinates because of tiling
     uint16_t* pixel = self->image;
@@ -1265,15 +1332,21 @@ int writeBody(lje* self) {
  * Read tile from an image and encode in one shot
  * Return the encoded data
  */
-int lj92_encode(uint16_t* image, int width, int height, int bitdepth, int components,
-                int readLength, int skipLength,
-                uint16_t* delinearize,int delinearizeLength,
-                uint8_t** encoded, int* encodedLength) {
+static int encodeInternal(uint16_t* image, int width, int height, int bitdepth,
+                          int components, int readLength, int skipLength,
+                          uint16_t* delinearize, int delinearizeLength,
+                          int predictor, const int histogram[18],
+                          const int16_t* residuals,
+                          lj92_entropy_writer entropyWriter,
+                          void* entropyContext,
+                          uint8_t** encoded, int* encodedLength) {
     int ret = LJ92_ERROR_NONE;
 
     lje* self = (lje*)calloc(sizeof(lje),1);
     if (self==NULL) return LJ92_ERROR_NO_MEMORY;
-    if (!image || !encoded || !encodedLength || width <= 0 || height <= 0 ||
+    if (!image || !encoded || !encodedLength ||
+        (histogram && (predictor < 1 || predictor > 7 || delinearize)) ||
+        width <= 0 || height <= 0 ||
         bitdepth < 2 || bitdepth > 16 || components < 1 || components > 4 ||
         width > INT_MAX / components / height ||
         readLength < width * components || skipLength < 0 ||
@@ -1290,11 +1363,19 @@ int lj92_encode(uint16_t* image, int width, int height, int bitdepth, int compon
     self->skipLength = skipLength;
     self->delinearize = delinearize;
     self->delinearizeLength = delinearizeLength;
+    self->residuals = residuals;
+    self->entropyWriter = entropyWriter;
+    self->entropyContext = entropyContext;
     self->encodedLength = width*height*components*3+256;
     self->encoded = malloc(self->encodedLength);
     if (self->encoded==NULL) { free(self); return LJ92_ERROR_NO_MEMORY; }
     // Scan through data to gather frequencies of ssss prefixes
-    ret = frequencyScan(self);
+    if (histogram) {
+        self->predictor = predictor;
+        memcpy(self->hist, histogram, sizeof(self->hist));
+    } else {
+        ret = frequencyScan(self);
+    }
     if (ret != LJ92_ERROR_NONE) {
         free(self->encoded);
         free(self);
@@ -1325,4 +1406,28 @@ int lj92_encode(uint16_t* image, int width, int height, int bitdepth, int compon
     free(self);
 
     return ret;
+}
+
+int lj92_encode(uint16_t* image, int width, int height, int bitdepth,
+                int components, int readLength, int skipLength,
+                uint16_t* delinearize, int delinearizeLength,
+                uint8_t** encoded, int* encodedLength) {
+    return encodeInternal(image, width, height, bitdepth, components,
+                          readLength, skipLength, delinearize,
+                          delinearizeLength, 0, NULL, NULL, NULL, NULL,
+                          encoded, encodedLength);
+}
+
+int lj92_encode_with_entropy_writer(uint16_t* image, int width, int height,
+                                   int bitdepth, int components, int readLength,
+                                   int skipLength, int predictor,
+                                   const int histogram[18],
+                                   const int16_t* residuals,
+                                   lj92_entropy_writer writer, void* context,
+                                   uint8_t** encoded, int* encodedLength) {
+    if (!histogram || !writer) return LJ92_ERROR_ENCODER;
+    return encodeInternal(image, width, height, bitdepth, components,
+                          readLength, skipLength, NULL, 0, predictor,
+                          histogram, residuals, writer, context,
+                          encoded, encodedLength);
 }

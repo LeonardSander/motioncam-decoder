@@ -79,6 +79,23 @@ int lj92_encode(uint16_t* image, int width, int height, int bitdepth, int compon
                 uint16_t* delinearize,int delinearizeLength,
                 uint8_t** encoded, int* encodedLength);
 
+/* Optional entropy writer. Return zero and set written on success; returning
+ * nonzero lets liblj92 use its CPU entropy writer. When residuals is NULL,
+ * the fallback recomputes differences from image samples. The output must
+ * include JPEG byte stuffing, but must not include the EOI marker. */
+typedef int (*lj92_entropy_writer)(const int16_t* residuals, int sampleCount,
+                                   const uint16_t codes[18],
+                                   const uint16_t codeBits[18],
+                                   uint8_t* output, int capacity,
+                                   int* written, void* context);
+int lj92_encode_with_entropy_writer(uint16_t* image, int width, int height,
+                                   int bitdepth, int components, int readLength,
+                                   int skipLength, int predictor,
+                                   const int histogram[18],
+                                   const int16_t* residuals,
+                                   lj92_entropy_writer writer, void* context,
+                                   uint8_t** encoded, int* encodedLength);
+
 #ifdef __cplusplus
 }
 #endif
