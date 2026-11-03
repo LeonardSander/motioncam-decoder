@@ -113,6 +113,24 @@ namespace motioncam {
         void loadAccelerometerData(std::vector<MotionSample>& outSamples);
         
     private:
+        struct Mc24Entry {
+            uint64_t frameOffset = 0;
+            std::map<uint16_t, std::vector<uint8_t>> metadataTags;
+        };
+        void initMc24();
+        void loadMc24Audio(std::vector<AudioChunk>& output);
+        std::vector<uint8_t> mc24Record(uint64_t offset, bool full = false) const;
+        nlohmann::json mc24FrameMetadata(Timestamp timestamp) const;
+        void loadMc24Frame(Timestamp timestamp, std::vector<uint8_t>& outData,
+                           nlohmann::json& outMetadata);
+        void loadMc24Motion(std::vector<MotionSample>& samples, bool acceleration);
+        bool mMc24 = false;
+        bool mMc24ValidateChecksums = false;
+        uint64_t mMc24FileSize = 0;
+        int mMc24Orientation = 2;
+        std::map<Timestamp, Mc24Entry> mMc24Entries;
+        std::map<uint32_t, std::vector<uint16_t>> mMc24Tables;
+        std::map<uint32_t, nlohmann::json> mMc24Shading;
         struct UnspektraEntry {
             uint64_t recipeOffset = 0;
             uint64_t rawOffset = 0;

@@ -139,6 +139,11 @@ namespace motioncam {
     void Decoder::init() {
         uint8_t signature[8]{};
         read(signature, sizeof(signature));
+        if (std::memcmp(signature, "MCPH", 4) == 0) {
+            mMc24 = true;
+            initMc24();
+            return;
+        }
         if(std::memcmp(signature, "UNSPKTRA", sizeof(signature)) == 0) {
             mUnspektra = true;
             initUnspektra();
@@ -204,6 +209,10 @@ namespace motioncam {
     }
     
     void Decoder::loadAudio(std::vector<AudioChunk>& outAudioChunks) {
+        if (mMc24) {
+            loadMc24Audio(outAudioChunks);
+            return;
+        }
         for(const auto& o : mAudioOffsets) {
             AudioChunk chunk;
             
@@ -223,10 +232,11 @@ namespace motioncam {
     }
 
     bool Decoder::hasAccelerometerData() const {
-        return !mAccelerometerOffsets.empty();
+        return mMc24 ? !mGyroOffsets.empty() : !mAccelerometerOffsets.empty();
     }
 
     void Decoder::loadGyroData(std::vector<MotionSample>& outGyroSamples) {
+        if (mMc24) { loadMc24Motion(outGyroSamples, false); return; }
         for(const auto& offset : mGyroOffsets) {
             if(FSEEK(mFile, offset.offset, SEEK_SET) != 0)
                 throw IOException("Invalid gyro data offset");
@@ -255,6 +265,7 @@ namespace motioncam {
     }
 
     void Decoder::loadAccelerometerData(std::vector<MotionSample>& outSamples) {
+        if (mMc24) { loadMc24Motion(outSamples, true); return; }
         for(const auto& offset : mAccelerometerOffsets) {
             if(FSEEK(mFile, offset.offset, SEEK_SET) != 0)
                 throw IOException("Invalid accelerometer data offset");
@@ -285,6 +296,10 @@ namespace motioncam {
     
     void Decoder::loadFrame(const Timestamp timestamp, std::vector<uint8_t>& outData,
                             nlohmann::json& outMetadata, int widthOverride) {
+        if (mMc24) {
+            loadMc24Frame(timestamp, outData, outMetadata);
+            return;
+        }
         if (mUnspektra) {
             // UFR1 declares its own raster width; a MotionCam stride repair
             // suffix does not apply to this container.
@@ -353,6 +368,7 @@ namespace motioncam {
     }
 
     void Decoder::loadFrameMetadata(const Timestamp timestamp, nlohmann::json& outMetadata) {
+        if (mMc24) { outMetadata = mc24FrameMetadata(timestamp); return; }
         if (mUnspektra) {
             outMetadata = unspektraFrameMetadata(timestamp);
             return;

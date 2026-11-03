@@ -13,7 +13,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 include_directories(motioncam_decoder lib/include thirdparty)
 
 find_package(ZLIB REQUIRED)
-add_library(motioncam_decoder lib/Decoder.cpp lib/RawData.cpp lib/RawData_Legacy.cpp lib/Unspektra.cpp)
+add_library(motioncam_decoder lib/Decoder.cpp lib/RawData.cpp lib/RawData_Legacy.cpp lib/Unspektra.cpp lib/Mc24.cpp lib/Mc24Raw.cpp)
 target_link_libraries(motioncam_decoder PUBLIC ZLIB::ZLIB)
 set_property(TARGET motioncam_decoder PROPERTY POSITION_INDEPENDENT_CODE ON)
 
@@ -26,6 +26,9 @@ add_executable(example example.cpp thirdparty/liblj92/lj92.c)
 target_link_libraries(example PRIVATE motioncam_decoder)
 
 if (BUILD_TESTING)
+    add_executable(decoder_mc24_test tests/DecoderMc24Test.cpp)
+    target_link_libraries(decoder_mc24_test PRIVATE motioncam_decoder)
+    add_test(NAME decoder_mc24_test COMMAND decoder_mc24_test)
     add_executable(decoder_test tests/DecoderTest.cpp)
     target_link_libraries(decoder_test PRIVATE motioncam_decoder)
     add_test(NAME decoder_test COMMAND decoder_test)
