@@ -1,6 +1,8 @@
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -61,6 +63,66 @@ void setChecksumValidation(bool enabled) {
         unsetenv("MOTIONCAM_MC24_VALIDATE_CHECKSUMS");
 #endif
 }
+void checkQuantizedBlackLevels(const std::filesystem::path &path) {
+    auto bytes = mc24_test::container;
+    const auto put32 = [&](size_t offset, uint32_t value) {
+        for (unsigned i = 0; i < 4; ++i)
+            bytes[offset + i] = uint8_t(value >> (8 * i));
+    };
+    const auto putFloat = [&](size_t offset, float value) {
+        uint32_t bits;
+        std::memcpy(&bits, &value, sizeof(bits));
+        put32(offset, bits);
+    };
+    // The fixed fixture's MCRL starts at 200. Supply the bin boundaries
+    // of an 8-bit linear reduction of a 10-bit sensor, including a black
+    // level whose bin has a half-integer center (63..66).
+    put32(144, 64);
+    put32(148, 65);
+    put32(152, 0);
+    put32(156, 1023);
+    putFloat(200 + 52, 1023);
+    for (unsigned i = 0; i < 256; ++i) {
+        const unsigned boundary = i ? unsigned(std::ceil((i - 0.5) * 1023 / 255)) : 0;
+        bytes[200 + 68 + 2 * i] = uint8_t(boundary);
+        bytes[200 + 69 + 2 * i] = uint8_t(boundary >> 8);
+    }
+    const auto updateHeaderCrc = [&](size_t offset, size_t headerSize) {
+        Bytes header(bytes.begin() + offset, bytes.begin() + offset + 12);
+        header.insert(header.end(), bytes.begin() + offset + 16,
+                      bytes.begin() + offset + headerSize);
+        put32(offset + 12, motioncam::mc24::crc32c(header.data(), header.size()));
+    };
+    updateHeaderCrc(0, 200);
+    for (unsigned mode = 0; mode < 3; ++mode) {
+        const bool log = mode == 1;
+        const bool corrected = mode == 0;
+        putFloat(200 + 48, log ? 1 : 0);
+        putFloat(200 + 56, mode == 2 ? 0 : -8);
+        updateHeaderCrc(200, 580);
+        writeTestInput(path, bytes);
+        motioncam::Decoder decoder(path.string());
+        for (const auto frame : decoder.getFrames()) {
+            nlohmann::json metadata;
+            Bytes raw;
+            decoder.loadFrame(frame, raw, metadata);
+            const auto black = metadata.at("dynamicBlackLevel").get<std::array<float, 4>>();
+            const std::array<float, 4> expected = corrected
+                ? std::array<float, 4>{62.5f, 63.5f, 0, 1022}
+                : std::array<float, 4>{64, 65, 0, 1023};
+            check(black == expected);
+            check(metadata.at("linearizationTable")[16] == 63);
+            check(raw[0] == 64 && raw[1] == 0);
+            if (corrected) {
+                // The average of the original samples in bin 16 is 64.5.
+                // Subtracting the corrected black from the retained LUT
+                // reconstructs that bin's signal above each channel's black.
+                check(63 - black[0] == 64.5f - 64);
+                check(63 - black[1] == 64.5f - 65);
+            }
+        }
+    }
+}
 int main() {
     const auto path =
         std::filesystem::temp_directory_path() /
@@ -70,6 +132,7 @@ int main() {
         setChecksumValidation(true);
         checkCrcPaths();
         checkBlockWidths();
+        checkQuantizedBlackLevels(path);
         // Golden lane-packed block: two absolute seeds of 64, then zero deltas.
         const Bytes packed{7, 64, 0, 64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};

@@ -151,6 +151,11 @@ namespace motioncam {
         int mMc24Orientation = 2;
         std::map<Timestamp, Mc24Entry> mMc24Entries;
         std::map<uint32_t, std::vector<uint16_t>> mMc24Tables;
+        struct Mc24LinearQuantization {
+            unsigned bits;
+            unsigned sensorWhite;
+        };
+        std::map<uint32_t, Mc24LinearQuantization> mMc24LinearQuantization;
         std::map<uint32_t, nlohmann::json> mMc24Shading;
         struct UnspektraEntry {
             uint64_t recipeOffset = 0;

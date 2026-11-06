@@ -244,6 +244,19 @@ void Decoder::initMc24() {
             for (unsigned i = 0; i < count; ++i)
                 table[i] = u16(p + 68 + 2 * i);
             require(std::is_sorted(table.begin(), table.end()), "Invalid mc24 linearization table");
+            const float depth = -f32(p + 56), white = f32(p + 52), log = f32(p + 48);
+            const auto id = u32(p + 24);
+            mMc24LinearQuantization.erase(id);
+            // Negative table parameter O denotes bit-depth reduction. Other
+            // tables (including HQ/SQ/LT) use their explicit reconstruction.
+            if (std::isfinite(depth) && depth >= 1 && depth <= 15 &&
+                depth == std::floor(depth) && std::isfinite(white) &&
+                white > 0 && white <= 65535 && white == std::floor(white) &&
+                std::isfinite(log) && log <= 0.5f) {
+                const unsigned bits = static_cast<unsigned>(depth);
+                if (white > float((1u << bits) - 1))
+                    mMc24LinearQuantization[id] = {bits, static_cast<unsigned>(white)};
+            }
         } else if (std::memcmp(p, "MCPB", 4) == 0 && record.size() >= 56 && u32(p + 40) == 1) {
             const unsigned width = u16(p + 48), height = u16(p + 50);
             require(width >= 2 && height >= 2 && width <= 512 && height <= 512 &&
@@ -363,6 +376,36 @@ nlohmann::json Decoder::mc24FrameMetadata(Timestamp timestamp) const {
     }
     if (const auto v = tag(t, 6, 4))
         result["dynamicWhiteLevel"] = u32(v);
+    if (p[54] == 1) {
+        const auto quantization = mMc24LinearQuantization.find(u32(p + 68));
+        if (quantization != mMc24LinearQuantization.end()) {
+            const auto [bits, white] = quantization->second;
+            const float scale = float((1u << bits) - 1) / float(white);
+            const auto &table = mMc24Tables.at(u32(p + 68));
+            auto black = result.at("dynamicBlackLevel").get<std::array<float, 4>>();
+            for (auto &level : black) {
+                require(std::isfinite(level), "Invalid mc24 black level");
+                if (level <= 0 || level > white)
+                    continue;
+                // Converter 0.5.1 centers linear quantization bins at black.
+                // Keep our explicit LUT and express the same zero point in
+                // its output domain, rather than in quantized code units.
+                const unsigned sample = static_cast<unsigned>(std::nearbyint(level));
+                const auto codeFor = [scale](unsigned value) {
+                    return static_cast<unsigned>(std::nearbyint(float(value) * scale));
+                };
+                const unsigned code = codeFor(sample);
+                require(code < table.size(), "mc24 black level outside linearization table");
+                unsigned low = sample, high = sample;
+                while (low && codeFor(low - 1) == code)
+                    --low;
+                while (high < white && codeFor(high + 1) == code)
+                    ++high;
+                level += float(table[code]) - (float(low) + float(high)) * 0.5f;
+            }
+            result["dynamicBlackLevel"] = black;
+        }
+    }
     if (const auto v = tag(t, 8, 16)) {
         const float r = f32(v), g1 = f32(v + 4), g2 = f32(v + 8), b = f32(v + 12);
         require(std::isfinite(r) && std::isfinite(b) && std::isfinite(g1) && std::isfinite(g2) &&
