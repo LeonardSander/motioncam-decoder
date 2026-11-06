@@ -83,12 +83,35 @@ if(decoder.hasAccelerometerData())
 ```
 
 Like `loadGyroData`, `loadAccelerometerData` appends to the supplied vector. Files
-without accelerometer data leave the vector unchanged. OIS chunks are safely
-skipped so they do not prevent discovery of the accelerometer index; OIS samples
-are not exposed by this API.
+without accelerometer data leave the vector unchanged. OIS chunks do not prevent
+discovery of the accelerometer index.
 
 The stream uses item IDs 12 (index) and 13 (data), with version-1 headers and the
 existing 24-byte `MotionSample` layout. The container version remains 3.
+
+### Embedded OIS data
+
+`loadOisData(std::vector<OisSample>&)` appends version-1 OIS samples. Each sample
+contains an `int64_t timestampNs` and two `float` fields, `xPixels` and `yPixels`.
+They use the sensor frame clock and active-array pixel coordinates (+X right,
++Y down), regardless of video rotation, crop or binning. These are pixel shifts,
+not nanometers or mechanical actuator positions. Malformed version-1 counts and
+non-finite values throw without modifying the caller's vector. Short and unknown
+version records remain available in `motioncamOisRecords` container metadata.
+
+Layout reference: [Gyroflow's MotionCam parser](https://github.com/AdrianEddy/telemetry-parser/blob/master/src/motioncam/mod.rs).
+Coordinate and clock reference: [Android OisSample](https://developer.android.com/reference/android/hardware/camera2/params/OisSample).
+
+Matching JSONL and GCSV sidecars override embedded/native telemetry in MotionCam
+Fuse. JSONL takes precedence when both are present. The selected source format is
+preserved; GCSV is never converted to JSONL or the reverse.
+
+MotionCam Fuse maps calibrated samples to Gyroflow protobuf `frame.ois`, using
+`camera.pixelPitchXNm` / `pixelPitchYNm` or pitch derived from container
+`sensorPhysicalSize` (millimeters) and `pixelArraySize`. Crop and binning retain
+full sensor pixel geometry. Without physical calibration, decoded samples remain
+in `camera.additionalData.motioncamOis`, with explicit pixel units; no nanometer
+values are invented. Original OIS records are retained as well.
 
 To run the decoder regression tests:
 

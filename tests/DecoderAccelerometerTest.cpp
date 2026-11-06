@@ -313,6 +313,15 @@ namespace {
         decoder.loadAccelerometerData(samples);
         expectSamples("mixed container", samples);
 
+        std::vector<motioncam::OisSample> ois;
+        decoder.loadOisData(ois);
+        expectEq("mixed OIS count", size_t { 1 }, ois.size());
+        if(ois.size() == 1) {
+            expectEq("OIS timestamp unchanged", int64_t { 1'002'000'000 }, ois[0].timestampNs);
+            expectFloatEq("OIS X pixels unchanged", 0.25f, ois[0].xPixels);
+            expectFloatEq("OIS Y pixels unchanged", -0.5f, ois[0].yPixels);
+        }
+
         expectTrue("mixed container retains gyro", decoder.hasGyroData());
         std::vector<motioncam::MotionSample> gyro;
         decoder.loadGyroData(gyro);

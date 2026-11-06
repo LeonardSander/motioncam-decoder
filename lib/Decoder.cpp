@@ -264,6 +264,33 @@ namespace motioncam {
         }
     }
 
+    void Decoder::loadOisData(std::vector<OisSample>& outSamples) const {
+        const auto records = mMetadata.find("motioncamOisRecords");
+        if(records == mMetadata.end()) return;
+        std::vector<OisSample> samples;
+        for(const auto& record : *records) {
+            if(record.at("type").get<uint32_t>() != static_cast<uint32_t>(Type::OIS_DATA)) continue;
+            const auto& payload = record.at("payload").get_binary();
+            // Leave short/unknown-version records opaque for forward compatibility.
+            if(payload.size() < 8) continue;
+            uint32_t version = 0, count = 0;
+            std::memcpy(&version, payload.data(), 4);
+            std::memcpy(&count, payload.data() + 4, 4);
+            if(version != 1) continue;
+            if(8 + static_cast<uint64_t>(count) * sizeof(OisSample) != payload.size())
+                throw IOException("Invalid OIS sample count");
+            if(count > samples.max_size() - samples.size())
+                throw IOException("Too many OIS samples");
+            const auto oldSize = samples.size();
+            samples.resize(oldSize + count);
+            if(count) std::memcpy(samples.data() + oldSize, payload.data() + 8, count * sizeof(OisSample));
+        }
+        for(const auto& sample : samples)
+            if(!std::isfinite(sample.xPixels) || !std::isfinite(sample.yPixels))
+                throw IOException("Non-finite OIS sample");
+        outSamples.insert(outSamples.end(), samples.begin(), samples.end());
+    }
+
     void Decoder::loadAccelerometerData(std::vector<MotionSample>& outSamples) {
         if (mMc24) { loadMc24Motion(outSamples, true); return; }
         for(const auto& offset : mAccelerometerOffsets) {
@@ -571,10 +598,18 @@ namespace motioncam {
             else if(item.type == Type::ACCELEROMETER_INDEX) {
                 readAccelerometerIndex(item.size);
             }
-            else if(item.type == Type::ACCELEROMETER_DATA || item.type == Type::OIS_DATA
-                || item.type == Type::OIS_INDEX) {
-                // OIS items can precede the accelerometer index in the tail.
-                // Skip their payloads without interpreting or allocating them.
+            else if(item.type == Type::OIS_DATA || item.type == Type::OIS_INDEX) {
+                // Retain original OIS records for forward compatibility and exact provenance.
+                // loadOisData exposes the documented version-1 sample layout.
+                if(!payloadFitsInFile(item.size))
+                    throw IOException("Invalid OIS payload");
+                std::vector<uint8_t> payload(item.size);
+                if(item.size) read(payload.data(), payload.size());
+                mMetadata["motioncamOisRecords"].push_back({
+                    {"type", static_cast<uint32_t>(item.type)}, {"payload", nlohmann::json::binary(std::move(payload))}});
+            }
+            else if(item.type == Type::ACCELEROMETER_DATA) {
+                // Samples are loaded lazily through their accelerometer index.
                 if(!payloadFitsInFile(item.size) || FSEEK(mFile, item.size, SEEK_CUR) != 0)
                     throw IOException("Invalid motion data payload");
             }

@@ -127,6 +127,11 @@ namespace motioncam {
         // the source platform's sensor axes/signs. No resampling or conversion.
         // Containers without accelerometer data leave outSamples unchanged.
         void loadAccelerometerData(std::vector<MotionSample>& outSamples);
+
+        // Append version-1 OIS samples in chunk order, without scaling, resampling,
+        // or rotating their native active-array pixel axes. Unknown OIS versions
+        // remain available verbatim in container metadata (motioncamOisRecords).
+        void loadOisData(std::vector<OisSample>& outSamples) const;
         
     private:
         struct Mc24Entry {

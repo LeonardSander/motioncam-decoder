@@ -205,8 +205,22 @@ void Decoder::initMc24() {
     mMetadata["mc24InputLog"] = recording.value("log", false);
     mMetadata["mc24Compression"] = recording.value("level", std::string("Lossless"));
 
+    auto& capture = mMetadata["captureTelemetry"];
+    capture["camera"] = {{"cameraBrand", manufacturer}, {"cameraModel", model},
+        {"firmwareVersion", stringTag(ht, 0x1004)}, {"lensModel", stringTag(ht, 0x100b)},
+        {"imuOrientation", stringTag(ht, 0x1041)}};
+    capture["clip"] = {{"recordFrameRate", recording.value("capFps", 0.0)},
+        {"sensorFrameRate", recording.value("capFps", 0.0)},
+        {"fileFrameRate", recording.value("playFps", 0.0)}};
+    if (const auto p = tag(ht, 0x1040, 4)) capture["clip"]["imuSampleRate"] = int(std::lround(f32(p)));
+    // Keep native camera fields, including ones not yet mapped to the schema.
+    nlohmann::json native = nlohmann::json::object();
+    for (const auto& item : ht) native[std::to_string(item.first)] = item.second;
+    capture["camera"]["additionalData"] = {{"mcproHeaderTags", native}};
+
     std::map<uint32_t, Timestamp> frameIds;
     std::map<uint32_t, uint64_t> metadata;
+    std::set<uint32_t> protobufKinds;
     for (uint64_t offset = 0; offset < mMc24FileSize;) {
         const auto record = mc24Record(offset);
         const auto p = record.data();
@@ -245,6 +259,20 @@ void Decoder::initMc24() {
             mMc24Shading[u32(p + 24)] = {{"lensShadingMapWidth", width},
                                          {"lensShadingMapHeight", height},
                                          {"lensShadingMap", maps}};
+        } else if (std::memcmp(p, "MCPB", 4) == 0 && record.size() >= 48) {
+            const auto kind = u32(p + 40), length = u32(p + 44);
+            require(length <= record.size() - 48, "Truncated mc24 metadata blob");
+            if (kind == 4) {
+                const auto profile = nlohmann::json::parse(p + 48, p + 48 + length);
+                mMetadata["captureTelemetry"]["camera"]["lensProfile"] = profile;
+            } else {
+                static constexpr char magic[] = "\x0a\x10GyroflowProtobuf";
+                if (length >= sizeof(magic) - 1 && std::memcmp(p + 48, magic, sizeof(magic) - 1) == 0)
+                    protobufKinds.insert(kind);
+                if (protobufKinds.count(kind))
+                    mMetadata["gyroflowProtobuf"].push_back({{"timestampNs", u64(p + 32)},
+                        {"payload", nlohmann::json::binary(std::vector<uint8_t>(p + 48, p + 48 + length))}});
+            }
         } else if (std::memcmp(p, "MCPA", 4) == 0) {
             require(record.size() >= 64, "Truncated mc24 audio record");
             mAudioOffsets.push_back(
@@ -357,6 +385,28 @@ nlohmann::json Decoder::mc24FrameMetadata(Timestamp timestamp) const {
         result["focalLength"] = f32(v);
     if (const auto v = tag(t, 0xf, 4))
         result["aperture"] = f32(v);
+    auto& capture = result["captureTelemetry"];
+    capture = nlohmann::json::object();
+    if (const auto v = tag(t, 0xc, 8)) capture["readoutTimeUs"] = u64(v) / 1000.0;
+    if (const auto v = tag(t, 0x1a, 16)) {
+        capture["cropX"] = u32(v); capture["cropY"] = u32(v + 4);
+        capture["cropWidth"] = u32(v + 8); capture["cropHeight"] = u32(v + 12);
+    }
+    nlohmann::json lens = nlohmann::json::object();
+    if (const auto v = tag(t, 0xe, 4)) lens["focalLengthMm"] = f32(v);
+    if (const auto v = tag(t, 0xf, 4)) lens["fNumber"] = f32(v);
+    if (const auto v = tag(t, 0xd, 4)) {
+        const auto diopters = f32(v);
+        if (std::isfinite(diopters) && diopters > 0) lens["focusDistanceMm"] = 1000.0 / diopters;
+    }
+    if (const auto v = tag(t, 0x11, 20))
+        lens["cameraIntrinsicMatrix"] = {f32(v), f32(v + 16), f32(v + 8), 0, f32(v + 4), f32(v + 12), 0, 0, 1};
+    if (const auto v = tag(t, 0x12, 20)) {
+        auto coefficients = nlohmann::json::array();
+        for (int i = 0; i < 5; ++i) coefficients.push_back(f32(v + 4 * i));
+        lens["opencvStandard"] = {{"coefficients", coefficients}};
+    }
+    if (!lens.empty()) capture["lens"] = nlohmann::json::array({lens});
     if (const auto v = tag(t, 0x1c, 4)) {
         const auto map = mMc24Shading.find(u32(v));
         if (map != mMc24Shading.end())

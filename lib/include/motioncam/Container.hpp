@@ -18,6 +18,7 @@
 #define Container_h
 
 #include <cstdint>
+#include <cstddef>
 #include <type_traits>
 
 namespace motioncam {
@@ -81,6 +82,19 @@ namespace motioncam {
     struct AudioMetadata {
         int64_t timestampNs;
     };
+
+    // Version-1 OIS chunks have a u32 version/count header and 16-byte samples.
+    // Android OIS coordinates: image displacement in active-array pixels,
+    // +X right / +Y down; nanosecond timestamps share the sensor frame clock.
+    struct OisSample {
+        int64_t timestampNs;
+        float xPixels;
+        float yPixels;
+    };
+    static_assert(sizeof(OisSample) == 16);
+    static_assert(offsetof(OisSample, xPixels) == 8);
+    static_assert(offsetof(OisSample, yPixels) == 12);
+    static_assert(std::is_trivially_copyable_v<OisSample>);
 
     struct GyroDataHeader {
         uint32_t version;
